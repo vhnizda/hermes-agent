@@ -1845,6 +1845,245 @@ class TestNewEndpoints:
         assert top_skill["total_count"] == 1
         assert top_skill["last_used_at"] is not None
 
+    def _seed_memory_wiki_sessions(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session("mw-infinite-racing", source="discord", model="test-model")
+            db.set_session_title("mw-infinite-racing", "Infinite Racing card balance")
+            db.append_message(
+                "mw-infinite-racing",
+                role="user",
+                content="Let's tune Infinite Racing pit stop cards and card balance.",
+            )
+            db.append_message(
+                "mw-infinite-racing",
+                role="assistant",
+                content="We adjusted Infinite Racing card balance notes.",
+            )
+
+            db.create_session("mw-hermes-gateway", source="cli", model="test-model")
+            db.set_session_title("mw-hermes-gateway", "Hermes Gateway keepalive")
+            db.append_message(
+                "mw-hermes-gateway",
+                role="user",
+                content="Fix Hermes Gateway WSL keepalive setup.",
+            )
+
+            db.create_session("mw-generic-search", source="cli", model="test-model")
+            db.set_session_title("mw-generic-search", "Search web")
+            db.append_message(
+                "mw-generic-search",
+                role="assistant",
+                content="Search results returned from a web lookup.",
+            )
+
+            def _retime(session_id, started_at):
+                def _do(conn):
+                    conn.execute(
+                        "UPDATE sessions SET started_at = ? WHERE id = ?",
+                        (started_at, session_id),
+                    )
+                    conn.execute(
+                        "UPDATE messages SET timestamp = ? WHERE session_id = ?",
+                        (started_at + 60, session_id),
+                    )
+                db._execute_write(_do)
+
+            _retime("mw-infinite-racing", 1704067200.0)
+            _retime("mw-hermes-gateway", 1704153600.0)
+            _retime("mw-generic-search", 1704240000.0)
+        finally:
+            db.close()
+
+    def test_memory_wiki_days_lists_days_with_session_counts(self):
+        self._seed_memory_wiki_sessions()
+
+        resp = self.client.get("/api/memory-wiki/days")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["days"][0]["date"] == "2024-01-03"
+        assert data["days"][0]["session_count"] == 1
+        assert data["days"][1]["date"] == "2024-01-02"
+        assert data["days"][1]["session_count"] == 1
+        assert data["days"][2]["date"] == "2024-01-01"
+        assert data["days"][2]["sources"] == ["discord"]
+
+    def test_memory_wiki_day_detail_returns_sessions_for_date(self):
+        self._seed_memory_wiki_sessions()
+
+        resp = self.client.get("/api/memory-wiki/days/2024-01-01")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["date"] == "2024-01-01"
+        assert data["summary"]["session_count"] == 1
+        assert data["sessions"][0]["id"] == "mw-infinite-racing"
+        assert data["sessions"][0]["title"] == "Infinite Racing card balance"
+        assert data["sessions"][0]["preview"]
+        assert data["wiki_summary"]["headline"]
+        assert any("Infinite Racing card balance" in bullet for bullet in data["wiki_summary"]["bullets"])
+
+    def test_memory_wiki_day_detail_caches_summary(self):
+        from hermes_constants import get_hermes_home
+
+        self._seed_memory_wiki_sessions()
+
+        first = self.client.get("/api/memory-wiki/days/2024-01-01").json()
+        second = self.client.get("/api/memory-wiki/days/2024-01-01").json()
+
+        assert first["wiki_summary"] == second["wiki_summary"]
+        cache_path = get_hermes_home() / "memory_wiki" / "days" / "2024-01-01.json"
+        assert cache_path.exists()
+
+    def test_memory_wiki_day_detail_prefers_stale_ai_summary_over_local_fallback(self):
+        from hermes_cli.web_server import _memory_wiki_write_cached_summary
+
+        self._seed_memory_wiki_sessions()
+        _memory_wiki_write_cached_summary(
+            "days",
+            "2024-01-01",
+            {"old": "signature"},
+            {
+                "headline": "2024-01-01",
+                "bullets": ["2024-01-01 — Tuned Infinite Racing card balance."],
+                "generated_by": "ai-daily-v1",
+            },
+        )
+
+        resp = self.client.get("/api/memory-wiki/days/2024-01-01")
+
+        assert resp.status_code == 200
+        summary = resp.json()["wiki_summary"]
+        assert summary["generated_by"] == "ai-daily-v1"
+        assert summary["stale"] is True
+        assert summary["bullets"] == ["2024-01-01 — Tuned Infinite Racing card balance."]
+
+    def test_memory_wiki_ai_daily_summary_parser_returns_concise_timestamped_bullets(self):
+        from hermes_cli.web_server import _memory_wiki_parse_ai_daily_summary
+
+        parsed = _memory_wiki_parse_ai_daily_summary(
+            """
+            {
+              "bullets": [
+                "Tuned Infinite Racing pit stop cards.",
+                "Updated card balance notes.",
+                "Attempted to verify the new wiki summary behavior."
+              ]
+            }
+            """,
+            "2024-01-01",
+        )
+
+        assert parsed["headline"] == "2024-01-01"
+        assert parsed["generated_by"] == "ai-daily-v1"
+        assert parsed["bullets"] == [
+            "2024-01-01 — Tuned Infinite Racing pit stop cards.",
+            "2024-01-01 — Updated card balance notes.",
+            "2024-01-01 — Attempted to verify the new wiki summary behavior.",
+        ]
+
+    def test_memory_wiki_ai_daily_summary_parser_limits_to_seven_bullets(self):
+        from hermes_cli.web_server import _memory_wiki_parse_ai_daily_summary
+
+        parsed = _memory_wiki_parse_ai_daily_summary(
+            "\n".join(f"- bullet {idx}" for idx in range(10)),
+            "2024-01-01",
+        )
+
+        assert len(parsed["bullets"]) == 7
+        assert all(item.startswith("2024-01-01 — ") for item in parsed["bullets"])
+
+    def test_memory_wiki_subjects_groups_related_sessions(self):
+        self._seed_memory_wiki_sessions()
+
+        resp = self.client.get("/api/memory-wiki/subjects")
+
+        assert resp.status_code == 200
+        subjects = {item["slug"]: item for item in resp.json()["subjects"]}
+        assert "infinite-racing" in subjects
+        assert subjects["infinite-racing"]["session_count"] == 1
+        assert subjects["infinite-racing"]["message_count"] >= 2
+        assert subjects["infinite-racing"]["query_terms"] == ["infinite", "racing"]
+        assert "hermes-gateway" in subjects
+        assert "search-web" not in subjects
+
+    def test_memory_wiki_subjects_excludes_internal_summary_prompts_and_raw_ids(self):
+        from hermes_state import SessionDB
+
+        self._seed_memory_wiki_sessions()
+        db = SessionDB()
+        try:
+            db.create_session("20260524_012007_884131", source="cli", model="test-model")
+            db.append_message(
+                "20260524_012007_884131",
+                role="user",
+                content="Summarize this Hermes Memory Wiki daily log for 2026-05-23.",
+            )
+            db.create_session("20260524_deadbeef", source="cli", model="test-model")
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/memory-wiki/subjects")
+
+        assert resp.status_code == 200
+        slugs = {item["slug"] for item in resp.json()["subjects"]}
+        assert "summarize-this" not in slugs
+        assert "hermes-memory" not in slugs
+        assert "deadbeef" not in " ".join(slugs)
+
+    def test_memory_wiki_hide_subject_stores_slug_and_excludes_from_list(self):
+        from hermes_constants import get_hermes_home
+
+        self._seed_memory_wiki_sessions()
+
+        hide_resp = self.client.post("/api/memory-wiki/subjects/infinite-racing/hide")
+        list_resp = self.client.get("/api/memory-wiki/subjects")
+
+        assert hide_resp.status_code == 200
+        assert hide_resp.json()["hidden"] is True
+        assert "infinite-racing" not in {item["slug"] for item in list_resp.json()["subjects"]}
+        hidden_path = get_hermes_home() / "memory_wiki" / "hidden_subjects.json"
+        assert hidden_path.exists()
+        assert "infinite-racing" in hidden_path.read_text(encoding="utf-8")
+
+    def test_memory_wiki_hidden_subject_detail_returns_404(self):
+        self._seed_memory_wiki_sessions()
+        self.client.post("/api/memory-wiki/subjects/infinite-racing/hide")
+
+        resp = self.client.get("/api/memory-wiki/subjects/infinite-racing")
+
+        assert resp.status_code == 404
+
+    def test_memory_wiki_subject_detail_returns_matching_messages(self):
+        self._seed_memory_wiki_sessions()
+
+        resp = self.client.get("/api/memory-wiki/subjects/infinite-racing")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["slug"] == "infinite-racing"
+        assert data["title"] == "Infinite Racing"
+        assert data["query_terms"] == ["infinite", "racing"]
+        assert data["sessions"][0]["id"] == "mw-infinite-racing"
+        assert data["wiki_summary"]["headline"]
+        assert any("pit stop cards" in bullet for bullet in data["wiki_summary"]["bullets"])
+        assert any("Infinite Racing" in hit["content"] for hit in data["message_hits"])
+
+    def test_memory_wiki_subject_detail_caches_summary(self):
+        from hermes_constants import get_hermes_home
+
+        self._seed_memory_wiki_sessions()
+
+        first = self.client.get("/api/memory-wiki/subjects/infinite-racing").json()
+        second = self.client.get("/api/memory-wiki/subjects/infinite-racing").json()
+
+        assert first["wiki_summary"] == second["wiki_summary"]
+        cache_path = get_hermes_home() / "memory_wiki" / "subjects" / "infinite-racing.json"
+        assert cache_path.exists()
+
     def test_session_token_endpoint_removed(self):
         """GET /api/auth/session-token no longer exists."""
         resp = self.client.get("/api/auth/session-token")

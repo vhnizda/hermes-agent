@@ -603,6 +603,7 @@ class ModelAssignment(BaseModel):
     scope="auxiliary"   → writes auxiliary.<task>.provider + auxiliary.<task>.model
     scope="auxiliary" with task=""  → applied to every auxiliary.* slot
     scope="auxiliary" with task="__reset__"  → resets every slot to provider="auto"
+    scope="routing"     → writes model_routing.<task>_model (task=cheap/default/critical)
     """
     scope: str
     provider: str
@@ -1783,7 +1784,13 @@ def get_auxiliary_models():
         else:
             main = {"provider": "", "model": str(model_cfg) if model_cfg else ""}
 
-        return {"tasks": tasks, "main": main}
+        try:
+            from hermes_cli.model_routing import get_model_routing_config
+            routing = get_model_routing_config(cfg)
+        except Exception:
+            routing = {"enabled": False, "policy": "conservative"}
+
+        return {"tasks": tasks, "main": main, "routing": routing}
     except Exception:
         _log.exception("GET /api/model/auxiliary failed")
         raise HTTPException(status_code=500, detail="Failed to read auxiliary config")
@@ -1802,8 +1809,8 @@ async def set_model_assignment(body: ModelAssignment):
     model = (body.model or "").strip()
     task = (body.task or "").strip().lower()
 
-    if scope not in {"main", "auxiliary"}:
-        raise HTTPException(status_code=400, detail="scope must be 'main' or 'auxiliary'")
+    if scope not in {"main", "auxiliary", "routing"}:
+        raise HTTPException(status_code=400, detail="scope must be 'main', 'auxiliary', or 'routing'")
 
     try:
         cfg = load_config()
@@ -1862,6 +1869,21 @@ async def set_model_assignment(body: ModelAssignment):
                 "model": model,
                 "gateway_tools": gateway_tools,
             }
+
+        if scope == "routing":
+            if task not in {"cheap", "default", "critical"}:
+                raise HTTPException(status_code=400, detail="routing task must be cheap, default, or critical")
+            if not provider or not model:
+                raise HTTPException(status_code=400, detail="provider and model required for routing")
+            routing = cfg.get("model_routing")
+            if not isinstance(routing, dict):
+                routing = {}
+            routing.setdefault("enabled", True)
+            routing.setdefault("policy", "conservative")
+            routing[f"{task}_model"] = {"provider": provider, "model": model}
+            cfg["model_routing"] = routing
+            save_config(cfg)
+            return {"ok": True, "scope": "routing", "task": task, "provider": provider, "model": model}
 
         # scope == "auxiliary"
         aux = cfg.get("auxiliary")
@@ -4154,6 +4176,597 @@ async def cancel_oauth_session(session_id: str, request: Request):
 
 
 # ---------------------------------------------------------------------------
+# Memory Wiki endpoints
+# ---------------------------------------------------------------------------
+
+
+_MEMORY_WIKI_STOPWORDS = {
+    "a", "about", "an", "and", "are", "as", "at", "be", "by", "can", "for", "from", "get", "got",
+    "has", "have", "help", "how", "i", "in", "is", "it", "let", "lets", "me", "my", "of", "on", "or",
+    "our", "setup", "the", "this", "to", "up", "we", "web", "what", "with", "you",
+    # Dashboard/session mechanics are too generic to be useful wiki subjects.
+    "browse", "browser", "chat", "check", "create", "debug", "error", "fix", "fixed", "log", "logs",
+    "message", "messages", "open", "page", "query", "result", "results", "search", "session", "sessions",
+    "show", "test", "testing", "update", "use", "using",
+    "summarize", "summary", "daily", "internal", "cron",
+}
+
+_MEMORY_WIKI_DENY_PHRASES = {
+    "summarize hermes",
+    "summarize memory",
+    "memory daily",
+    "research top",
+    "able access",
+}
+
+
+def _memory_wiki_hidden_subjects_path() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "memory_wiki" / "hidden_subjects.json"
+
+
+def _memory_wiki_hidden_subjects() -> set[str]:
+    path = _memory_wiki_hidden_subjects_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return {_memory_wiki_slug(str(item)) for item in data if str(item).strip()}
+    except (OSError, json.JSONDecodeError):
+        pass
+    return set()
+
+
+def _memory_wiki_save_hidden_subjects(hidden: set[str]) -> None:
+    path = _memory_wiki_hidden_subjects_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(sorted(hidden), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _memory_wiki_is_internal_summary_text(text: str) -> bool:
+    compact = " ".join((text or "").lower().split())
+    return "summarize this hermes memory wiki daily log" in compact
+
+
+def _memory_wiki_date(timestamp: float) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(float(timestamp or 0)))
+
+
+def _memory_wiki_day_bounds(date: str) -> tuple[float, float]:
+    import datetime as _dt
+
+    try:
+        start = _dt.datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=_dt.timezone.utc)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Date must be YYYY-MM-DD")
+    return start.timestamp(), (start + _dt.timedelta(days=1)).timestamp()
+
+
+def _memory_wiki_slug(text: str) -> str:
+    import re as _re
+
+    slug = _re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+    return slug or "untitled"
+
+
+def _memory_wiki_title_from_slug(slug: str) -> str:
+    return " ".join(part.capitalize() for part in (slug or "").split("-") if part)
+
+
+def _memory_wiki_preview(text: str, limit: int = 180) -> str:
+    compact = " ".join((text or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 1].rstrip() + "…"
+
+
+def _memory_wiki_subject_for_text(text: str) -> tuple[str, str, list[str]] | None:
+    import re as _re
+
+    raw_text = text or ""
+    if _memory_wiki_is_internal_summary_text(raw_text):
+        return None
+    if _re.fullmatch(r"\d{8}(?:[_-][a-f0-9]{6,})?", raw_text.strip().lower()):
+        return None
+    words = [w.lower().strip("'") for w in _re.findall(r"[A-Za-z][A-Za-z0-9']*", raw_text)]
+    significant = [w for w in words if w not in _MEMORY_WIKI_STOPWORDS and len(w) > 2]
+    if len(significant) < 2:
+        return None
+
+    # Prefer the first meaningful phrase. Session titles tend to lead with
+    # the thing the user thinks the conversation was about, while later words
+    # are usually actions/details ("balance", "keepalive", "notes", etc.).
+    chosen: list[str] = []
+    for word in significant:
+        if word in chosen:
+            continue
+        chosen.append(word)
+        if len(chosen) == 2:
+            break
+    if len(chosen) < 2:
+        return None
+    phrase = " ".join(chosen)
+    if phrase in _MEMORY_WIKI_DENY_PHRASES:
+        return None
+    title = " ".join(part.capitalize() for part in chosen)
+    return _memory_wiki_slug(phrase), title, chosen
+
+
+def _memory_wiki_session_rows(db, *, limit: int = 500) -> list[dict[str, Any]]:
+    conn = getattr(db, "_conn", None)
+    if conn is None:
+        return db.list_sessions_rich(limit=limit, offset=0)
+    rows = conn.execute(
+        """
+        SELECT
+            s.id,
+            s.source,
+            s.model,
+            s.title,
+            s.started_at,
+            s.ended_at,
+            s.message_count,
+            COALESCE(m.last_active, s.started_at) AS last_active,
+            first_msg.content AS preview
+        FROM sessions s
+        LEFT JOIN (
+            SELECT session_id, MAX(timestamp) AS last_active
+            FROM messages
+            GROUP BY session_id
+        ) m ON m.session_id = s.id
+        LEFT JOIN messages first_msg ON first_msg.id = (
+            SELECT id FROM messages
+            WHERE session_id = s.id AND role IN ('user', 'assistant') AND content IS NOT NULL AND content != ''
+            ORDER BY timestamp ASC, id ASC
+            LIMIT 1
+        )
+        ORDER BY s.started_at DESC, s.id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _memory_wiki_message_rows(db, session_ids: list[str] | None = None, *, limit: int = 500) -> list[dict[str, Any]]:
+    conn = getattr(db, "_conn", None)
+    if conn is None:
+        return []
+    params: list[Any] = []
+    where = "WHERE m.content IS NOT NULL AND m.content != '' AND m.role IN ('user', 'assistant')"
+    if session_ids:
+        placeholders = ",".join("?" for _ in session_ids)
+        where += f" AND m.session_id IN ({placeholders})"
+        params.extend(session_ids)
+    params.append(limit)
+    rows = conn.execute(
+        f"""
+        SELECT
+            m.id,
+            m.session_id,
+            m.role,
+            m.content,
+            m.timestamp,
+            s.title AS session_title,
+            s.source,
+            s.started_at AS session_started
+        FROM messages m
+        JOIN sessions s ON s.id = m.session_id
+        {where}
+        ORDER BY m.timestamp DESC, m.id DESC
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _memory_wiki_cache_path(kind: str, key: str) -> Path:
+    from hermes_constants import get_hermes_home
+
+    safe_key = _memory_wiki_slug(key)
+    return get_hermes_home() / "memory_wiki" / kind / f"{safe_key}.json"
+
+
+def _memory_wiki_signature(payload: dict[str, Any]) -> str:
+    import hashlib as _hashlib
+
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return _hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _memory_wiki_cached_summary(kind: str, key: str, signature_payload: dict[str, Any], generator) -> dict[str, Any]:
+    signature = _memory_wiki_signature(signature_payload)
+    path = _memory_wiki_cache_path(kind, key)
+    try:
+        if path.exists():
+            cached = json.loads(path.read_text(encoding="utf-8"))
+            cached_summary = cached.get("summary")
+            if cached.get("signature") == signature and isinstance(cached_summary, dict):
+                return cached_summary
+            # Daily AI captain's logs should remain visible even when the
+            # underlying day receives a few new messages after manual backfill.
+            # The nightly/script generator overwrites this cache with a fresh
+            # signature; until then, prefer the readable AI log over falling
+            # back to the all-caps local extraction.
+            if kind == "days" and isinstance(cached_summary, dict):
+                generated_by = str(cached_summary.get("generated_by") or "")
+                if generated_by.startswith("ai-"):
+                    cached_summary["stale"] = True
+                    return cached_summary
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    summary = generator()
+    summary.setdefault("generated_at", time.time())
+    summary["cache_kind"] = kind
+    summary["cache_key"] = key
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"signature": signature, "summary": summary}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return summary
+
+
+def _memory_wiki_write_cached_summary(kind: str, key: str, signature_payload: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any]:
+    signature = _memory_wiki_signature(signature_payload)
+    path = _memory_wiki_cache_path(kind, key)
+    summary.setdefault("generated_at", time.time())
+    summary["cache_kind"] = kind
+    summary["cache_key"] = key
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"signature": signature, "summary": summary}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return summary
+
+
+def _memory_wiki_sentence_fragment(text: str, limit: int = 140) -> str:
+    fragment = _memory_wiki_preview(text, limit=limit)
+    return fragment.rstrip(". ")
+
+
+def _memory_wiki_normalize_ai_bullet(text: str, date: str) -> str | None:
+    import re as _re
+
+    bullet = _re.sub(r"^[-*•\d.)\s]+", "", (text or "").strip()).strip()
+    if not bullet:
+        return None
+    if bullet.startswith(f"{date} — "):
+        return bullet
+    if bullet.startswith(f"{date} - "):
+        return f"{date} — {bullet[len(date) + 3:].strip()}"
+    return f"{date} — {bullet}"
+
+
+def _memory_wiki_parse_ai_daily_summary(raw: str, date: str) -> dict[str, Any]:
+    import re as _re
+
+    bullets: list[str] = []
+    text = (raw or "").strip()
+    if text:
+        try:
+            parsed = json.loads(text)
+            candidate = parsed.get("bullets") if isinstance(parsed, dict) else parsed
+            if isinstance(candidate, list):
+                for item in candidate:
+                    normalized = _memory_wiki_normalize_ai_bullet(str(item), date)
+                    if normalized:
+                        bullets.append(normalized)
+        except json.JSONDecodeError:
+            pass
+    if not bullets:
+        for line in text.splitlines():
+            if _re.match(r"^\s*(?:[-*•]|\d+[.)])\s+", line):
+                normalized = _memory_wiki_normalize_ai_bullet(line, date)
+                if normalized:
+                    bullets.append(normalized)
+    if not bullets and text:
+        for sentence in _re.split(r"(?<=[.!?])\s+", text):
+            normalized = _memory_wiki_normalize_ai_bullet(sentence, date)
+            if normalized:
+                bullets.append(normalized)
+    return {
+        "headline": date,
+        "bullets": bullets[:7] or [f"{date} — No clear accomplishments or attempts were identified."],
+        "generated_by": "ai-daily-v1",
+    }
+
+
+def _memory_wiki_day_signature_payload(date: str, sessions: list[dict[str, Any]], summary: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "date": date,
+        "summary": summary,
+        "sessions": [
+            {
+                "id": s.get("id"),
+                "title": s.get("title"),
+                "message_count": s.get("message_count"),
+                "last_active": s.get("last_active"),
+                "preview": s.get("preview"),
+            }
+            for s in sessions
+        ],
+    }
+
+
+def _memory_wiki_day_summary(date: str, sessions: list[dict[str, Any]], summary: dict[str, Any]) -> dict[str, Any]:
+    def _generate() -> dict[str, Any]:
+        session_count = int(summary.get("session_count") or 0)
+        message_count = int(summary.get("message_count") or 0)
+        sources = summary.get("sources") or []
+        source_text = f" via {', '.join(sources)}" if sources else ""
+        headline = f"{date}: {session_count} session{'s' if session_count != 1 else ''}, {message_count} message{'s' if message_count != 1 else ''}{source_text}."
+        bullets = []
+        for session in sessions[:6]:
+            title = session.get("title") or session.get("id") or "Untitled session"
+            preview = _memory_wiki_sentence_fragment(session.get("preview") or "")
+            if preview:
+                bullets.append(f"{title}: {preview}")
+            else:
+                bullets.append(str(title))
+        if not bullets:
+            bullets.append("No readable session messages were captured for this day yet.")
+        return {
+            "headline": headline,
+            "bullets": bullets,
+            "generated_by": "local-extractive-v1",
+        }
+
+    signature_payload = _memory_wiki_day_signature_payload(date, sessions, summary)
+    return _memory_wiki_cached_summary("days", date, signature_payload, _generate)
+
+
+def _memory_wiki_subject_summary(title: str, slug: str, query_terms: list[str], sessions: list[dict[str, Any]], hits: list[dict[str, Any]], summary: dict[str, Any]) -> dict[str, Any]:
+    def _generate() -> dict[str, Any]:
+        session_count = int(summary.get("session_count") or 0)
+        message_count = int(summary.get("message_count") or 0)
+        headline = f"{title}: found across {session_count} session{'s' if session_count != 1 else ''} and {message_count} related message{'s' if message_count != 1 else ''}."
+        bullets: list[str] = []
+        for hit in hits[:6]:
+            content = _memory_wiki_sentence_fragment(hit.get("content") or "", limit=180)
+            if not content:
+                continue
+            session_title = hit.get("session_title") or hit.get("session_id") or "Session"
+            bullets.append(f"{session_title}: {content}")
+        if not bullets:
+            for session in sessions[:6]:
+                title_text = session.get("title") or session.get("id") or "Untitled session"
+                preview = _memory_wiki_sentence_fragment(session.get("preview") or "", limit=180)
+                bullets.append(f"{title_text}: {preview}" if preview else str(title_text))
+        if not bullets:
+            bullets.append("No readable message snippets were captured for this subject yet.")
+        return {
+            "headline": headline,
+            "bullets": bullets,
+            "generated_by": "local-extractive-v1",
+            "query_terms": query_terms,
+        }
+
+    signature_payload = {
+        "slug": slug,
+        "title": title,
+        "query_terms": query_terms,
+        "summary": summary,
+        "sessions": [
+            {
+                "id": s.get("id"),
+                "title": s.get("title"),
+                "message_count": s.get("message_count"),
+                "last_active": s.get("last_active"),
+                "preview": s.get("preview"),
+            }
+            for s in sessions
+        ],
+        "hits": [
+            {
+                "id": h.get("id"),
+                "session_id": h.get("session_id"),
+                "timestamp": h.get("timestamp"),
+                "content": h.get("content"),
+            }
+            for h in hits[:50]
+        ],
+    }
+    return _memory_wiki_cached_summary("subjects", slug, signature_payload, _generate)
+
+
+@app.get("/api/memory-wiki/days")
+async def get_memory_wiki_days(limit: int = 90):
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        buckets: dict[str, dict[str, Any]] = {}
+        for session in _memory_wiki_session_rows(db, limit=5000):
+            date = _memory_wiki_date(session.get("started_at") or 0)
+            bucket = buckets.setdefault(
+                date,
+                {"date": date, "session_count": 0, "message_count": 0, "sources": set(), "latest_at": 0},
+            )
+            bucket["session_count"] += 1
+            bucket["message_count"] += int(session.get("message_count") or 0)
+            if session.get("source"):
+                bucket["sources"].add(session["source"])
+            bucket["latest_at"] = max(float(bucket["latest_at"] or 0), float(session.get("last_active") or session.get("started_at") or 0))
+        days = sorted(buckets.values(), key=lambda item: item["date"], reverse=True)[:limit]
+        for day in days:
+            day["sources"] = sorted(day["sources"])
+        return {"days": days}
+    finally:
+        db.close()
+
+
+@app.get("/api/memory-wiki/days/{date}")
+async def get_memory_wiki_day(date: str):
+    from hermes_state import SessionDB
+
+    start, end = _memory_wiki_day_bounds(date)
+    db = SessionDB()
+    try:
+        sessions = [
+            session for session in _memory_wiki_session_rows(db, limit=5000)
+            if start <= float(session.get("started_at") or 0) < end
+        ]
+        sessions.sort(key=lambda item: float(item.get("started_at") or 0), reverse=True)
+        response_sessions = []
+        sources = set()
+        message_count = 0
+        for session in sessions:
+            sources.add(session.get("source"))
+            message_count += int(session.get("message_count") or 0)
+            response_sessions.append({
+                "id": session.get("id"),
+                "title": session.get("title") or session.get("id"),
+                "source": session.get("source"),
+                "model": session.get("model"),
+                "started_at": session.get("started_at"),
+                "last_active": session.get("last_active"),
+                "message_count": session.get("message_count") or 0,
+                "preview": _memory_wiki_preview(session.get("preview") or ""),
+            })
+        day_summary = {
+            "session_count": len(response_sessions),
+            "message_count": message_count,
+            "sources": sorted(s for s in sources if s),
+        }
+        return {
+            "date": date,
+            "summary": day_summary,
+            "wiki_summary": _memory_wiki_day_summary(date, response_sessions, day_summary),
+            "sessions": response_sessions,
+        }
+    finally:
+        db.close()
+
+
+def _memory_wiki_subject_index(db) -> dict[str, dict[str, Any]]:
+    subjects: dict[str, dict[str, Any]] = {}
+    session_by_id = {s.get("id"): s for s in _memory_wiki_session_rows(db, limit=5000)}
+    messages = _memory_wiki_message_rows(db, limit=20000)
+
+    for session in session_by_id.values():
+        candidate = _memory_wiki_subject_for_text(session.get("title") or session.get("preview") or session.get("id") or "")
+        if not candidate:
+            continue
+        slug, title, query_terms = candidate
+        entry = subjects.setdefault(slug, {"slug": slug, "title": title, "query_terms": query_terms, "session_ids": set(), "message_count": 0, "latest_at": 0})
+        entry["session_ids"].add(session.get("id"))
+        entry["latest_at"] = max(float(entry["latest_at"] or 0), float(session.get("last_active") or session.get("started_at") or 0))
+
+    for message in messages:
+        session = session_by_id.get(message.get("session_id"), {})
+        candidate = _memory_wiki_subject_for_text(session.get("title") or message.get("content") or "")
+        if not candidate:
+            continue
+        slug, title, query_terms = candidate
+        entry = subjects.setdefault(slug, {"slug": slug, "title": title, "query_terms": query_terms, "session_ids": set(), "message_count": 0, "latest_at": 0})
+        entry["session_ids"].add(message.get("session_id"))
+        entry["message_count"] += 1
+        entry["latest_at"] = max(float(entry["latest_at"] or 0), float(message.get("timestamp") or 0))
+
+    return subjects
+
+
+@app.get("/api/memory-wiki/subjects")
+async def get_memory_wiki_subjects(limit: int = 100):
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        subjects = []
+        hidden = _memory_wiki_hidden_subjects()
+        for entry in _memory_wiki_subject_index(db).values():
+            if entry["slug"] in hidden:
+                continue
+            subjects.append({
+                "slug": entry["slug"],
+                "title": entry["title"],
+                "query_terms": entry.get("query_terms") or [],
+                "session_count": len(entry["session_ids"]),
+                "message_count": entry["message_count"],
+                "latest_at": entry["latest_at"],
+            })
+        subjects.sort(key=lambda item: (item["session_count"], item["message_count"], item["latest_at"]), reverse=True)
+        return {"subjects": subjects[:limit]}
+    finally:
+        db.close()
+
+
+@app.post("/api/memory-wiki/subjects/{slug}/hide")
+async def hide_memory_wiki_subject(slug: str):
+    safe_slug = _memory_wiki_slug(slug)
+    hidden = _memory_wiki_hidden_subjects()
+    hidden.add(safe_slug)
+    _memory_wiki_save_hidden_subjects(hidden)
+    return {"slug": safe_slug, "hidden": True}
+
+
+@app.get("/api/memory-wiki/subjects/{slug}")
+async def get_memory_wiki_subject(slug: str):
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        subjects = _memory_wiki_subject_index(db)
+        entry = subjects.get(slug)
+        if not entry or slug in _memory_wiki_hidden_subjects():
+            raise HTTPException(status_code=404, detail="Subject not found")
+        session_ids = sorted(entry["session_ids"])
+        sessions_by_id = {s.get("id"): s for s in _memory_wiki_session_rows(db, limit=5000) if s.get("id") in session_ids}
+        sessions = []
+        for sid in session_ids:
+            session = sessions_by_id.get(sid)
+            if not session:
+                continue
+            sessions.append({
+                "id": sid,
+                "title": session.get("title") or sid,
+                "source": session.get("source"),
+                "started_at": session.get("started_at"),
+                "last_active": session.get("last_active"),
+                "message_count": session.get("message_count") or 0,
+                "preview": _memory_wiki_preview(session.get("preview") or ""),
+            })
+        sessions.sort(key=lambda item: float(item.get("last_active") or item.get("started_at") or 0), reverse=True)
+        query_terms = entry.get("query_terms") or [part.lower() for part in entry["title"].split()]
+        hits = []
+        for message in _memory_wiki_message_rows(db, session_ids=session_ids, limit=500):
+            content_lc = (message.get("content") or "").lower()
+            if query_terms and not all(term in content_lc for term in query_terms):
+                # Keep session-level matches even when only the title mentions the subject,
+                # but prioritize direct message hits for the detail view.
+                continue
+            hits.append({
+                "id": message.get("id"),
+                "session_id": message.get("session_id"),
+                "role": message.get("role"),
+                "content": _memory_wiki_preview(message.get("content") or "", limit=500),
+                "timestamp": message.get("timestamp"),
+                "session_title": message.get("session_title"),
+                "source": message.get("source"),
+            })
+        subject_summary = {
+            "session_count": len(sessions),
+            "message_count": entry["message_count"],
+            "latest_at": entry["latest_at"],
+        }
+        return {
+            "slug": slug,
+            "title": entry["title"],
+            "query_terms": query_terms,
+            "summary": subject_summary,
+            "wiki_summary": _memory_wiki_subject_summary(entry["title"], slug, query_terms, sessions, hits, subject_summary),
+            "sessions": sessions,
+            "message_hits": hits[:50],
+        }
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
 # Session detail endpoints
 # ---------------------------------------------------------------------------
 
@@ -4582,6 +5195,8 @@ class CronJobCreate(BaseModel):
     schedule: str
     name: str = ""
     deliver: str = "local"
+    model: Optional[str] = None
+    provider: Optional[str] = None
 
 
 class CronJobUpdate(BaseModel):
@@ -4616,12 +5231,61 @@ def _cron_profile_home(profile: Optional[str]) -> Tuple[str, Path]:
     return canon, profiles_mod.get_profile_dir(canon)
 
 
+def _cron_profile_config_and_default_model(home: Path) -> Tuple[Dict[str, Any], str, str]:
+    """Return (config, provider, model) configured for a profile, best-effort."""
+    try:
+        import yaml
+
+        cfg_path = home / "config.yaml"
+        cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
+    except Exception:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    model_cfg = cfg.get("model") or {}
+    if isinstance(model_cfg, str):
+        return cfg, "", model_cfg
+    if isinstance(model_cfg, dict):
+        provider = str(model_cfg.get("provider") or "").strip()
+        model = str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
+        return cfg, provider, model
+    return cfg, "", ""
+
+
+def _cron_profile_default_model(home: Path) -> Tuple[str, str]:
+    """Return (provider, model) configured for a profile, best-effort."""
+    _, provider, model = _cron_profile_config_and_default_model(home)
+    return provider, model
+
+
 def _annotate_cron_job(job: Dict[str, Any], profile: str, home: Path) -> Dict[str, Any]:
     annotated = dict(job)
     annotated["profile"] = profile
     annotated["profile_name"] = profile
     annotated["hermes_home"] = str(home)
     annotated["is_default_profile"] = profile == "default"
+
+    explicit_provider = str(job.get("provider") or "").strip()
+    explicit_model = str(job.get("model") or "").strip()
+    cfg, default_provider, default_model = _cron_profile_config_and_default_model(home)
+    routed_provider = default_provider
+    routed_model = default_model
+    routing_class = "default"
+    routing_reason = "default model"
+    try:
+        from hermes_cli.model_routing import route_model_for_task
+        routed = route_model_for_task(job=job, config=cfg)
+        routed_provider = routed.provider or routed_provider
+        routed_model = routed.model or routed_model
+        routing_class = routed.task_class
+        routing_reason = routed.reason
+    except Exception:
+        pass
+    annotated["uses_default_model"] = not bool(explicit_model or explicit_provider) and routed_model == default_model
+    annotated["effective_provider"] = explicit_provider or routed_provider
+    annotated["effective_model"] = explicit_model or routed_model
+    annotated["routing_class"] = job.get("routing_class") or routing_class
+    annotated["routing_reason"] = routing_reason
     return annotated
 
 
@@ -4707,6 +5371,8 @@ async def create_cron_job(body: CronJobCreate, profile: str = "default"):
             schedule=body.schedule,
             name=body.name,
             deliver=body.deliver,
+            model=body.model,
+            provider=body.provider,
         )
     except Exception as e:
         _log.exception("POST /api/cron/jobs failed")
@@ -6423,6 +7089,18 @@ async def get_models_analytics(days: int = 30):
     try:
         cutoff = time.time() - (days * 86400)
 
+        from datetime import datetime, time as dt_time, timedelta
+        try:
+            from zoneinfo import ZoneInfo
+            local_tz = ZoneInfo(os.environ.get("TZ") or "Europe/Prague")
+        except Exception:
+            local_tz = None
+        now_local = datetime.now(local_tz) if local_tz else datetime.now().astimezone()
+        today_start_local = datetime.combine(now_local.date(), dt_time(4, 0), tzinfo=now_local.tzinfo)
+        if now_local < today_start_local:
+            today_start_local -= timedelta(days=1)
+        today_cutoff = today_start_local.timestamp()
+
         cur = db._conn.execute("""
             SELECT model,
                    billing_provider,
@@ -6443,10 +7121,37 @@ async def get_models_analytics(days: int = 30):
         """, (cutoff,))
         rows = [dict(r) for r in cur.fetchall()]
 
-        models = []
-        for row in rows:
-            provider = row.get("billing_provider") or ""
-            model_name = row["model"]
+        def _usage_by_model(where_sql: str, params: tuple) -> dict[tuple[str, str], dict]:
+            usage_cur = db._conn.execute(f"""
+                SELECT model,
+                       billing_provider,
+                       COALESCE(SUM(input_tokens), 0) as input_tokens,
+                       COALESCE(SUM(output_tokens), 0) as output_tokens,
+                       COALESCE(SUM(cache_read_tokens), 0) as cache_read_tokens,
+                       COALESCE(SUM(reasoning_tokens), 0) as reasoning_tokens
+                FROM sessions
+                WHERE {where_sql} AND model IS NOT NULL AND model != ''
+                GROUP BY model, billing_provider
+            """, params)
+            return {
+                (r["model"], r["billing_provider"] or ""): dict(r)
+                for r in usage_cur.fetchall()
+            }
+
+        lifetime_usage = _usage_by_model("1=1", ())
+        today_usage = _usage_by_model("started_at >= ?", (today_cutoff,))
+
+        def _total_tokens(row: dict | None) -> int:
+            if not row:
+                return 0
+            return (
+                int(row.get("input_tokens") or 0)
+                + int(row.get("output_tokens") or 0)
+                + int(row.get("cache_read_tokens") or 0)
+                + int(row.get("reasoning_tokens") or 0)
+            )
+
+        def _capabilities(provider: str, model_name: str) -> dict:
             caps = {}
             try:
                 from agent.models_dev import get_model_capabilities
@@ -6462,6 +7167,64 @@ async def get_models_analytics(days: int = 30):
                     }
             except Exception:
                 pass
+            return caps
+
+        def _known_configured_models() -> set[tuple[str, str]]:
+            """Models configured on cron/model routing should appear before much usage accrues."""
+            known: set[tuple[str, str]] = set()
+            try:
+                from cron.jobs import list_jobs
+                for job in list_jobs(include_disabled=True):
+                    model_name = str(job.get("model") or "").strip()
+                    provider = str(job.get("provider") or "").strip()
+                    if model_name:
+                        known.add((model_name, provider))
+            except Exception:
+                pass
+            try:
+                cfg = load_config()
+                routing = cfg.get("model_routing") if isinstance(cfg, dict) else None
+                if isinstance(routing, dict):
+                    for key in ("default_model", "cheap_model", "critical_model"):
+                        entry = routing.get(key)
+                        if isinstance(entry, dict):
+                            model_name = str(entry.get("model") or "").strip()
+                            provider = str(entry.get("provider") or "").strip()
+                            if model_name:
+                                known.add((model_name, provider))
+            except Exception:
+                pass
+            return known
+
+        def _empty_row(model_name: str, provider: str) -> dict:
+            return {
+                "model": model_name,
+                "billing_provider": provider,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "reasoning_tokens": 0,
+                "estimated_cost": 0,
+                "actual_cost": 0,
+                "sessions": 0,
+                "api_calls": 0,
+                "tool_calls": 0,
+                "last_used_at": None,
+                "avg_tokens_per_session": 0,
+            }
+
+        row_by_key = {(r["model"], r.get("billing_provider") or ""): r for r in rows}
+        for key in sorted(_known_configured_models()):
+            row_by_key.setdefault(key, _empty_row(*key))
+
+        models = []
+        for row in row_by_key.values():
+            provider = row.get("billing_provider") or ""
+            model_name = row["model"]
+            key = (model_name, provider)
+            lifetime = lifetime_usage.get(key)
+            today = today_usage.get(key)
+            caps = _capabilities(provider, model_name)
 
             models.append({
                 "model": model_name,
@@ -6477,8 +7240,24 @@ async def get_models_analytics(days: int = 30):
                 "tool_calls": row["tool_calls"],
                 "last_used_at": row["last_used_at"],
                 "avg_tokens_per_session": row["avg_tokens_per_session"],
+                "tokens_to_date": _total_tokens(lifetime),
+                "today_input_tokens": int(today.get("input_tokens") or 0) if today else 0,
+                "today_output_tokens": int(today.get("output_tokens") or 0) if today else 0,
+                "today_cache_read_tokens": int(today.get("cache_read_tokens") or 0) if today else 0,
+                "today_reasoning_tokens": int(today.get("reasoning_tokens") or 0) if today else 0,
+                "today_total_tokens": _total_tokens(today),
+                "today_started_at": today_cutoff,
                 "capabilities": caps,
             })
+
+        models.sort(
+            key=lambda m: (
+                int(m.get("tokens_to_date") or 0),
+                int(m.get("today_total_tokens") or 0),
+                int(m.get("input_tokens") or 0) + int(m.get("output_tokens") or 0),
+            ),
+            reverse=True,
+        )
 
         totals_cur = db._conn.execute("""
             SELECT COUNT(DISTINCT model) as distinct_models,
@@ -6493,6 +7272,31 @@ async def get_models_analytics(days: int = 30):
             FROM sessions WHERE started_at > ? AND model IS NOT NULL AND model != ''
         """, (cutoff,))
         totals = dict(totals_cur.fetchone())
+        totals["distinct_models"] = len(models)
+
+        lifetime_totals_cur = db._conn.execute("""
+            SELECT COALESCE(SUM(input_tokens), 0) as input_tokens,
+                   COALESCE(SUM(output_tokens), 0) as output_tokens,
+                   COALESCE(SUM(cache_read_tokens), 0) as cache_read_tokens,
+                   COALESCE(SUM(reasoning_tokens), 0) as reasoning_tokens
+            FROM sessions WHERE model IS NOT NULL AND model != ''
+        """)
+        today_totals_cur = db._conn.execute("""
+            SELECT COALESCE(SUM(input_tokens), 0) as input_tokens,
+                   COALESCE(SUM(output_tokens), 0) as output_tokens,
+                   COALESCE(SUM(cache_read_tokens), 0) as cache_read_tokens,
+                   COALESCE(SUM(reasoning_tokens), 0) as reasoning_tokens
+            FROM sessions WHERE started_at >= ? AND model IS NOT NULL AND model != ''
+        """, (today_cutoff,))
+        lifetime_totals = dict(lifetime_totals_cur.fetchone())
+        today_totals = dict(today_totals_cur.fetchone())
+        totals["tokens_to_date"] = _total_tokens(lifetime_totals)
+        totals["today_input_tokens"] = int(today_totals.get("input_tokens") or 0)
+        totals["today_output_tokens"] = int(today_totals.get("output_tokens") or 0)
+        totals["today_cache_read_tokens"] = int(today_totals.get("cache_read_tokens") or 0)
+        totals["today_reasoning_tokens"] = int(today_totals.get("reasoning_tokens") or 0)
+        totals["today_total_tokens"] = _total_tokens(today_totals)
+        totals["today_started_at"] = today_cutoff
 
         return {
             "models": models,

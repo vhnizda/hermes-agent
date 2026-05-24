@@ -71,6 +71,7 @@ import EnvPage from "@/pages/EnvPage";
 import SessionsPage from "@/pages/SessionsPage";
 import LogsPage from "@/pages/LogsPage";
 import AnalyticsPage from "@/pages/AnalyticsPage";
+import MemoryWikiPage from "@/pages/MemoryWikiPage";
 import ModelsPage from "@/pages/ModelsPage";
 import CronPage from "@/pages/CronPage";
 import ProfilesPage from "@/pages/ProfilesPage";
@@ -124,6 +125,7 @@ const CHAT_NAV_ITEM: NavItem = {
 const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/": RootRedirect,
   "/sessions": SessionsPage,
+  "/memory-wiki": MemoryWikiPage,
   "/analytics": AnalyticsPage,
   "/models": ModelsPage,
   "/logs": LogsPage,
@@ -155,6 +157,11 @@ const BUILTIN_NAV_REST: NavItem[] = [
     labelKey: "sessions",
     label: "Sessions",
     icon: MessageSquare,
+  },
+  {
+    path: "/memory-wiki",
+    label: "Memory Wiki",
+    icon: BookOpen,
   },
   {
     path: "/analytics",

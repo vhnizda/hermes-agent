@@ -848,7 +848,40 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _job_inference_env(job: dict) -> dict[str, str]:
+    """Return environment variables that make scripts honor per-job model overrides.
+
+    Normal agent cron jobs already pass ``job['model']`` / ``job['provider']``
+    into AIAgent construction.  Script jobs can still invoke Hermes internally
+    (for example via ``hermes_cli.oneshot._run_agent``), so bridge the same
+    override through the standard inference env vars.
+    """
+    env: dict[str, str] = {}
+    model = str(job.get("model") or "").strip()
+    provider = str(job.get("provider") or "").strip()
+    base_url = str(job.get("base_url") or "").strip()
+    if not model:
+        try:
+            from hermes_cli.model_routing import route_model_for_task
+            routed = route_model_for_task(job=job)
+            model = routed.model
+            provider = provider or routed.provider
+            if routed.task_class:
+                env["HERMES_ROUTING_CLASS"] = routed.task_class
+            if routed.reason:
+                env["HERMES_ROUTING_REASON"] = routed.reason
+        except Exception:
+            pass
+    if model:
+        env["HERMES_INFERENCE_MODEL"] = model
+    if provider:
+        env["HERMES_INFERENCE_PROVIDER"] = provider
+    if base_url:
+        env["HERMES_INFERENCE_BASE_URL"] = base_url
+    return env
+
+
+def _run_job_script(script_path: str, env_overrides: Optional[dict[str, str]] = None) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -928,6 +961,8 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
 
     run_env = os.environ.copy()
     run_env["HERMES_HOME"] = str(_get_hermes_home())
+    if env_overrides:
+        run_env.update({str(k): str(v) for k, v in env_overrides.items() if str(v).strip()})
     try:
         from hermes_constants import get_subprocess_home
 
@@ -1021,7 +1056,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         if prerun_script is not None:
             success, script_output = prerun_script
         else:
-            success, script_output = _run_job_script(script_path)
+            success, script_output = _run_job_script(script_path, _job_inference_env(job))
         if success:
             if script_output:
                 prompt = (
@@ -1290,7 +1325,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 _prior_cwd = None
 
         try:
-            ok, output = _run_job_script(script_path)
+            ok, output = _run_job_script(script_path, _job_inference_env(job))
         finally:
             if _prior_cwd is not None:
                 try:
@@ -1518,6 +1553,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             )
 
         model = job.get("model") or os.getenv("HERMES_MODEL") or ""
+        routed_provider = str(job.get("provider") or "").strip()
 
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
         _cfg = {}
@@ -1530,10 +1566,24 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 _cfg = _expand_env_vars(_cfg)
                 _model_cfg = _cfg.get("model", {})
                 if not job.get("model"):
-                    if isinstance(_model_cfg, str):
-                        model = _model_cfg
-                    elif isinstance(_model_cfg, dict):
-                        model = _model_cfg.get("default", model)
+                    try:
+                        from hermes_cli.model_routing import route_model_for_task
+                        routed = route_model_for_task(job=job, config=_cfg)
+                        model = routed.model or model
+                        routed_provider = routed.provider or routed_provider
+                        logger.info(
+                            "Job '%s': model router selected %s/%s (%s)",
+                            job_id,
+                            routed_provider or "default-provider",
+                            model or "default-model",
+                            routed.reason,
+                        )
+                    except Exception as route_exc:
+                        logger.debug("Job '%s': model router unavailable: %s", job_id, route_exc)
+                        if isinstance(_model_cfg, str):
+                            model = _model_cfg
+                        elif isinstance(_model_cfg, dict):
+                            model = _model_cfg.get("default", model)
         except Exception as e:
             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 
@@ -1586,7 +1636,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             # circuits that precedence and can resurrect old providers (for
             # example DeepSeek) for cron jobs that do not pin provider/model.
             runtime_kwargs = {
-                "requested": job.get("provider"),
+                "requested": routed_provider or job.get("provider"),
             }
             if job.get("base_url"):
                 runtime_kwargs["explicit_base_url"] = job.get("base_url")

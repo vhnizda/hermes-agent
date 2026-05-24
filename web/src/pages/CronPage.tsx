@@ -93,6 +93,21 @@ function getJobProfile(job: CronJob): string {
   return asText(job.profile) || asText(job.profile_name) || "default";
 }
 
+function getJobModelLabel(job: CronJob): string {
+  const model = asText(job.effective_model) || asText(job.model);
+  if (!model) return "model: default";
+  const shortModel = model.split("/").pop() || model;
+  return job.uses_default_model ? `default: ${shortModel}` : shortModel;
+}
+
+function getJobModelTitle(job: CronJob): string {
+  const provider = asText(job.effective_provider) || asText(job.provider) || "default provider";
+  const model = asText(job.effective_model) || asText(job.model) || "default model";
+  return job.uses_default_model
+    ? `Uses default model: ${provider} / ${model}`
+    : `Explicit model: ${provider} / ${model}`;
+}
+
 function getJobKey(job: CronJob): string {
   return `${getJobProfile(job)}:${job.id}`;
 }
@@ -643,6 +658,9 @@ export default function CronPage() {
                       {state}
                     </Badge>
                     <Badge tone="outline">{profileLabel(profile)}</Badge>
+                    <Badge tone="outline" title={getJobModelTitle(job)}>
+                      {getJobModelLabel(job)}
+                    </Badge>
                     {deliver && deliver !== "local" && (
                       <Badge tone="outline">{deliver}</Badge>
                     )}

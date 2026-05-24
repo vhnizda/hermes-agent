@@ -739,6 +739,14 @@ DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
     "fallback_providers": [],
+    "model_routing": {
+        "enabled": False,
+        "policy": "conservative",
+        "auto_route_no_agent_scripts": False,
+        "default_model": {"provider": "", "model": ""},
+        "cheap_model": {"provider": "", "model": ""},
+        "critical_model": {"provider": "", "model": ""},
+    },
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     "agent": {
