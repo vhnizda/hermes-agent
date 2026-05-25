@@ -110,6 +110,29 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
         )
         return None
 
+
+def _ensure_cron_session_title(session_db, session_id: str, job_name: str) -> None:
+    """Give cron-created sessions a stable human-readable title.
+
+    ``AIAgent`` creates the SQLite session row lazily on first message flush,
+    so cron runs used to appear as "Untitled" in recent sessions until the
+    scheduler's final cleanup renamed them. Long-running jobs and failed jobs
+    were therefore confusing in the dashboard. Set the title as soon as the
+    row exists, and keep the final cleanup as a safety net for older/edge paths.
+    """
+    if not session_db or not session_id:
+        return
+    try:
+        existing = session_db.get_session_title(session_id)
+    except Exception:
+        existing = None
+    if existing:
+        return
+    base_title = f"Cron job: {job_name}"
+    title = session_db.get_next_title_in_lineage(base_title)
+    session_db.set_session_title(session_id, title)
+
+
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
 _KNOWN_DELIVERY_PLATFORMS = frozenset({
@@ -1738,6 +1761,16 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        if _session_db:
+            try:
+                # Create the DB row now instead of waiting for the first flush,
+                # so Recent Sessions never shows this run as "Untitled" while
+                # the cron job is still executing.
+                if hasattr(agent, "_ensure_db_session"):
+                    agent._ensure_db_session()
+                _ensure_cron_session_title(_session_db, _cron_session_id, job_name)
+            except (Exception, KeyboardInterrupt) as e:
+                logger.debug("Job '%s': failed to pre-title cron session: %s", job_id, e)
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
@@ -1910,6 +1943,10 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
         if _session_db:
+            try:
+                _ensure_cron_session_title(_session_db, _cron_session_id, job_name)
+            except (Exception, KeyboardInterrupt) as e:
+                logger.debug("Job '%s': failed to title cron session: %s", job_id, e)
             try:
                 _session_db.end_session(_cron_session_id, "cron_complete")
             except (Exception, KeyboardInterrupt) as e:

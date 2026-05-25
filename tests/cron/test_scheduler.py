@@ -875,6 +875,8 @@ class TestRunJobSessionPersistence:
             "prompt": "hello",
         }
         fake_db = MagicMock()
+        fake_db.get_session_title.side_effect = [None, "Cron job: test"]
+        fake_db.get_next_title_in_lineage.return_value = "Cron job: test"
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
              patch("cron.scheduler._resolve_origin", return_value=None), \
@@ -909,6 +911,12 @@ class TestRunJobSessionPersistence:
         call_args = fake_db.end_session.call_args
         assert call_args[0][0].startswith("cron_test-job_")
         assert call_args[0][1] == "cron_complete"
+        mock_agent._ensure_db_session.assert_called_once()
+        fake_db.get_next_title_in_lineage.assert_called_once_with("Cron job: test")
+        fake_db.set_session_title.assert_called_once()
+        title_args = fake_db.set_session_title.call_args.args
+        assert title_args[0].startswith("cron_test-job_")
+        assert title_args[1] == "Cron job: test"
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
 
