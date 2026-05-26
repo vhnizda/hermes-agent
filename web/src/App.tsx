@@ -160,7 +160,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
   },
   {
     path: "/memory-wiki",
-    label: "Memory Wiki",
+    label: "Session Summary",
     icon: BookOpen,
   },
   {

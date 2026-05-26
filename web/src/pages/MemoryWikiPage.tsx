@@ -440,16 +440,16 @@ export default function MemoryWikiPage() {
             <CardHeader>
               <div className="flex items-center gap-2">
                 <BookOpen className="h-5 w-5 text-muted-foreground" />
-                <CardTitle className="text-base">Memory Wiki</CardTitle>
+                <CardTitle className="text-base">Session Summary</CardTitle>
               </div>
             </CardHeader>
             <CardContent className="space-y-4">
               <div className="grid grid-cols-2 gap-2">
                 <Button outlined={tab !== "days"} onClick={() => setTab("days")}>
-                  Daily Logs
+                  By Day
                 </Button>
                 <Button outlined={tab !== "subjects"} onClick={() => setTab("subjects")}>
-                  Subjects
+                  By Subject
                 </Button>
               </div>
               <div className="relative">
