@@ -5,7 +5,7 @@ import {
   useCallback,
   useRef,
 } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -659,6 +659,8 @@ export default function SessionsPage() {
   const { setAfterTitle, setEnd } = usePageHeader();
   const { activeAction, actionStatus, dismissLog } = useSystemActions();
   const resumeInChatEnabled = isDashboardEmbeddedChatEnabled();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const deepLinkedSessionId = searchParams.get("session");
 
   const refreshEmptyCount = useCallback(() => {
     api
@@ -731,6 +733,24 @@ export default function SessionsPage() {
     loadSessions(page);
     refreshEmptyCount();
   }, [loadSessions, page, refreshEmptyCount]);
+
+  useEffect(() => {
+    if (!deepLinkedSessionId) return;
+    setExpandedId(deepLinkedSessionId);
+    api
+      .getSession(deepLinkedSessionId)
+      .then((session) => {
+        setSessions((prev) => {
+          if (prev.some((item) => item.id === session.id)) return prev;
+          return [session, ...prev];
+        });
+      })
+      .catch(() => {
+        const next = new URLSearchParams(searchParams);
+        next.delete("session");
+        setSearchParams(next, { replace: true });
+      });
+  }, [deepLinkedSessionId, searchParams, setSearchParams]);
 
   useEffect(() => {
     const loadOverview = () => {

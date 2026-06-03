@@ -9,6 +9,8 @@ Usage:
     python -m hermes_cli.main web --port 8080
 """
 
+from contextlib import asynccontextmanager
+
 import asyncio
 import base64
 import binascii
@@ -84,7 +86,43 @@ except ImportError:
 WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
 _log = logging.getLogger(__name__)
 
-app = FastAPI(title="Hermes Agent", version=__version__)
+# ---------------------------------------------------------------------------
+# Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
+# and /api/events (dashboard → browser sidebar).  Keyed by an opaque channel id
+# the chat tab generates on mount; entries auto-evict when the last subscriber
+# drops AND the publisher has disconnected.
+#
+# State lives on app.state (not module-level globals) so that asyncio.Lock is
+# created on the running event loop during lifespan startup.  A module-level
+# asyncio.Lock() binds to whatever loop was active at import time, which breaks
+# when the same module is used across TestClient instances or uvicorn reloads.
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def _lifespan(app: "FastAPI"):
+    app.state.event_channels = {}  # dict[str, set]
+    app.state.event_lock = asyncio.Lock()
+    yield
+
+
+def _get_event_state(app: "FastAPI"):
+    """Return (event_channels, event_lock) from app.state.
+
+    Lazily initialises the state if the lifespan hasn't run (e.g. when
+    TestClient is constructed without a ``with`` block).  The lifespan
+    path is preferred because it guarantees the Lock is created on the
+    correct event loop, but the lazy path lets existing non-``with``
+    TestClient usages keep working.
+    """
+    try:
+        return app.state.event_channels, app.state.event_lock
+    except AttributeError:
+        app.state.event_channels = {}
+        app.state.event_lock = asyncio.Lock()
+        return app.state.event_channels, app.state.event_lock
+
+
+app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
 
 # ---------------------------------------------------------------------------
 # Session token for protecting sensitive endpoints (reveal).
@@ -565,6 +603,7 @@ class ModelAssignment(BaseModel):
     scope="auxiliary"   → writes auxiliary.<task>.provider + auxiliary.<task>.model
     scope="auxiliary" with task=""  → applied to every auxiliary.* slot
     scope="auxiliary" with task="__reset__"  → resets every slot to provider="auto"
+    scope="routing"     → writes model_routing.<task>_model (task=cheap/default/critical)
     """
     scope: str
     provider: str
@@ -1627,7 +1666,9 @@ def get_model_options():
     try:
         from hermes_cli.inventory import build_models_payload, load_picker_context
 
-        return build_models_payload(load_picker_context(), max_models=50, pricing=True)
+        return build_models_payload(
+            load_picker_context(), max_models=50, pricing=True, capabilities=True
+        )
     except Exception:
         _log.exception("GET /api/model/options failed")
         raise HTTPException(status_code=500, detail="Failed to list model options")
@@ -1743,7 +1784,13 @@ def get_auxiliary_models():
         else:
             main = {"provider": "", "model": str(model_cfg) if model_cfg else ""}
 
-        return {"tasks": tasks, "main": main}
+        try:
+            from hermes_cli.model_routing import get_model_routing_config
+            routing = get_model_routing_config(cfg)
+        except Exception:
+            routing = {"enabled": False, "policy": "conservative"}
+
+        return {"tasks": tasks, "main": main, "routing": routing}
     except Exception:
         _log.exception("GET /api/model/auxiliary failed")
         raise HTTPException(status_code=500, detail="Failed to read auxiliary config")
@@ -1762,8 +1809,8 @@ async def set_model_assignment(body: ModelAssignment):
     model = (body.model or "").strip()
     task = (body.task or "").strip().lower()
 
-    if scope not in {"main", "auxiliary"}:
-        raise HTTPException(status_code=400, detail="scope must be 'main' or 'auxiliary'")
+    if scope not in {"main", "auxiliary", "routing"}:
+        raise HTTPException(status_code=400, detail="scope must be 'main', 'auxiliary', or 'routing'")
 
     try:
         cfg = load_config()
@@ -1822,6 +1869,21 @@ async def set_model_assignment(body: ModelAssignment):
                 "model": model,
                 "gateway_tools": gateway_tools,
             }
+
+        if scope == "routing":
+            if task not in {"cheap", "default", "critical"}:
+                raise HTTPException(status_code=400, detail="routing task must be cheap, default, or critical")
+            if not provider or not model:
+                raise HTTPException(status_code=400, detail="provider and model required for routing")
+            routing = cfg.get("model_routing")
+            if not isinstance(routing, dict):
+                routing = {}
+            routing.setdefault("enabled", True)
+            routing.setdefault("policy", "conservative")
+            routing[f"{task}_model"] = {"provider": provider, "model": model}
+            cfg["model_routing"] = routing
+            save_config(cfg)
+            return {"ok": True, "scope": "routing", "task": task, "provider": provider, "model": model}
 
         # scope == "auxiliary"
         aux = cfg.get("auxiliary")
@@ -2935,6 +2997,17 @@ _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
         "docs_url": "https://www.minimax.io",
         "status_fn": None,  # dispatched via auth.get_minimax_oauth_auth_status
     },
+    {
+        "id": "xai-oauth",
+        "name": "xAI Grok OAuth (SuperGrok / Premium+)",
+        # Loopback PKCE: the desktop's local backend binds a 127.0.0.1
+        # callback server, the client opens the browser, and the redirect
+        # lands back on the loopback listener — no code to copy/paste.
+        "flow": "loopback",
+        "cli_command": "hermes auth add xai-oauth",
+        "docs_url": "https://hermes-agent.nousresearch.com/docs/guides/xai-grok-oauth",
+        "status_fn": None,  # dispatched via auth.get_xai_oauth_auth_status
+    },
 )
 
 
@@ -2988,6 +3061,20 @@ def _resolve_provider_status(provider_id: str, status_fn) -> Dict[str, Any]:
                 "expires_at": raw.get("expires_at"),
                 "has_refresh_token": True,
             }
+        if provider_id == "xai-oauth":
+            raw = hauth.get_xai_oauth_auth_status()
+            # source_label is meant to be a human-readable origin (auth-store
+            # path / credential source), not the internal auth_mode string
+            # ("oauth_pkce"). Prefer the store path, then the source slug.
+            return {
+                "logged_in": bool(raw.get("logged_in")),
+                "source": raw.get("source") or "xai_oauth",
+                "source_label": raw.get("auth_store") or raw.get("source") or "xAI Grok OAuth",
+                "token_preview": _truncate_token(raw.get("api_key")),
+                "expires_at": None,
+                "has_refresh_token": True,
+                "last_refresh": raw.get("last_refresh"),
+            }
     except Exception as e:
         return {"logged_in": False, "error": str(e)}
     return {"logged_in": False}
@@ -3000,7 +3087,7 @@ async def list_oauth_providers():
     Response shape (per provider):
         id              stable identifier (used in DELETE path)
         name            human label
-        flow            "pkce" | "device_code" | "external"
+        flow            "pkce" | "device_code" | "external" | "loopback"
         cli_command     fallback CLI command for users to run manually
         docs_url        external docs/portal link for the "Learn more" link
         status:
@@ -3099,6 +3186,19 @@ async def disconnect_oauth_provider(provider_id: str, request: Request):
 #          every 2s until status != "pending".
 #     4. On "approved" the background thread has already saved creds; UI
 #        refreshes the providers list.
+#
+#   Loopback PKCE (xAI Grok):
+#     1. POST /api/providers/oauth/xai-oauth/start
+#          → server binds a 127.0.0.1 callback listener, builds the xAI
+#            authorize URL, spawns a background worker waiting on the redirect
+#          → returns { session_id, flow: "loopback", auth_url, expires_in }
+#     2. UI opens auth_url in the browser. There is NO user_code/code to
+#        paste — the redirect lands back on the loopback listener.
+#     3. UI polls GET /api/providers/oauth/{provider}/poll/{session_id}
+#          (same endpoint as device_code) until status != "pending".
+#     4. The worker exchanges the code, persists creds, sets "approved".
+#        DELETE /sessions/{id} cancels: the worker bails before persisting
+#        and the callback server is shut down to free the port immediately.
 #
 # Sessions are kept in-memory only (single-process FastAPI) and time out
 # after 15 minutes. A periodic cleanup runs on each /start call to GC
@@ -3483,6 +3583,220 @@ async def _start_device_code_flow(provider_id: str) -> Dict[str, Any]:
     raise HTTPException(status_code=400, detail=f"Provider {provider_id} does not support device-code flow")
 
 
+# xAI Grok OAuth uses a loopback-redirect PKCE flow (RFC 8252). Unlike the
+# device-code providers there is no user_code to display: the local backend
+# binds a 127.0.0.1 callback server, the client opens the authorize URL in
+# the browser, and the redirect lands back on the loopback listener. The
+# background worker waits for that callback, exchanges the code, and persists
+# the tokens exactly like `hermes auth add xai-oauth`.
+_XAI_LOOPBACK_TIMEOUT_SECONDS = 300.0
+
+
+def _start_xai_loopback_flow() -> Dict[str, Any]:
+    """Begin the xAI loopback PKCE flow.
+
+    Binds the local callback server, builds the authorize URL, and spawns a
+    background worker that waits for the redirect and finishes the exchange.
+    Returns the authorize URL for the client to open in the browser.
+    """
+    from hermes_cli import auth as hauth
+
+    discovery = hauth._xai_oauth_discovery()
+    server, thread, callback_result, redirect_uri = hauth._xai_start_callback_server()
+    try:
+        hauth._xai_validate_loopback_redirect_uri(redirect_uri)
+        verifier = hauth._oauth_pkce_code_verifier()
+        challenge = hauth._oauth_pkce_code_challenge(verifier)
+        state = secrets.token_hex(16)
+        nonce = secrets.token_hex(16)
+        authorize_url = hauth._xai_oauth_build_authorize_url(
+            authorization_endpoint=discovery["authorization_endpoint"],
+            redirect_uri=redirect_uri,
+            code_challenge=challenge,
+            state=state,
+            nonce=nonce,
+        )
+    except Exception:
+        # Binding succeeded but URL construction failed — release the socket
+        # and join the serving thread so we don't leak a listener (or a
+        # lingering daemon thread) on the loopback port.
+        try:
+            server.shutdown()
+            server.server_close()
+        except Exception:
+            pass
+        try:
+            thread.join(timeout=1.0)
+        except Exception:
+            pass
+        raise
+
+    sid, sess = _new_oauth_session("xai-oauth", "loopback")
+    sess["server"] = server
+    sess["thread"] = thread
+    sess["callback_result"] = callback_result
+    sess["redirect_uri"] = redirect_uri
+    sess["verifier"] = verifier
+    sess["challenge"] = challenge
+    sess["state"] = state
+    sess["token_endpoint"] = discovery["token_endpoint"]
+    sess["discovery"] = discovery
+    sess["expires_at"] = time.time() + _XAI_LOOPBACK_TIMEOUT_SECONDS
+    threading.Thread(
+        target=_xai_loopback_worker, args=(sid,), daemon=True,
+        name=f"oauth-xai-{sid[:6]}",
+    ).start()
+    return {
+        "session_id": sid,
+        "flow": "loopback",
+        "auth_url": authorize_url,
+        "expires_in": int(_XAI_LOOPBACK_TIMEOUT_SECONDS),
+    }
+
+
+def _xai_loopback_worker(session_id: str) -> None:
+    """Wait for the xAI loopback callback, exchange the code, persist tokens."""
+    from datetime import datetime, timezone
+
+    from hermes_cli import auth as hauth
+
+    with _oauth_sessions_lock:
+        sess = _oauth_sessions.get(session_id)
+    if not sess:
+        return
+
+    def _fail(message: str) -> None:
+        with _oauth_sessions_lock:
+            s = _oauth_sessions.get(session_id)
+            if s is not None:
+                s["status"] = "error"
+                s["error_message"] = message
+
+    def _cancelled() -> bool:
+        # The session is removed from the registry when the user cancels
+        # (DELETE /sessions/{id}). If that happened while we were blocked on
+        # the callback or token exchange, abort instead of persisting tokens
+        # the user no longer wants.
+        with _oauth_sessions_lock:
+            return session_id not in _oauth_sessions
+
+    try:
+        callback = hauth._xai_wait_for_callback(
+            sess["server"],
+            sess["thread"],
+            sess["callback_result"],
+            timeout_seconds=_XAI_LOOPBACK_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        _fail(f"xAI authorization timed out: {exc}")
+        return
+
+    if _cancelled():
+        return
+
+    if callback.get("error"):
+        detail = callback.get("error_description") or callback["error"]
+        _fail(f"xAI authorization failed: {detail}")
+        return
+    if callback.get("state") != sess["state"]:
+        _fail("xAI authorization failed: state mismatch.")
+        return
+    code = str(callback.get("code") or "").strip()
+    if not code:
+        _fail("xAI authorization failed: missing authorization code.")
+        return
+
+    try:
+        payload = hauth._xai_oauth_exchange_code_for_tokens(
+            token_endpoint=sess["token_endpoint"],
+            code=code,
+            redirect_uri=sess["redirect_uri"],
+            code_verifier=sess["verifier"],
+            code_challenge=sess["challenge"],
+        )
+        access_token = str(payload.get("access_token", "") or "").strip()
+        refresh_token = str(payload.get("refresh_token", "") or "").strip()
+        if not access_token or not refresh_token:
+            _fail("xAI token exchange did not return the expected tokens.")
+            return
+        base_url = hauth._xai_validate_inference_base_url(
+            os.getenv("HERMES_XAI_BASE_URL", "").strip().rstrip("/")
+            or os.getenv("XAI_BASE_URL", "").strip().rstrip("/"),
+            fallback=hauth.DEFAULT_XAI_OAUTH_BASE_URL,
+        )
+        last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        tokens = {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "id_token": str(payload.get("id_token", "") or "").strip(),
+            "expires_in": payload.get("expires_in"),
+            "token_type": str(payload.get("token_type") or "Bearer").strip() or "Bearer",
+        }
+        if _cancelled():
+            return
+        hauth._save_xai_oauth_tokens(
+            tokens,
+            discovery=sess.get("discovery"),
+            redirect_uri=sess["redirect_uri"],
+            last_refresh=last_refresh,
+        )
+        _add_xai_oauth_pool_entry(access_token, refresh_token, base_url, last_refresh)
+    except Exception as exc:
+        _fail(f"xAI token exchange failed: {exc}")
+        return
+
+    with _oauth_sessions_lock:
+        s = _oauth_sessions.get(session_id)
+        if s is not None:
+            s["status"] = "approved"
+    _log.info("oauth/loopback: xai-oauth login completed (session=%s)", session_id)
+
+
+def _add_xai_oauth_pool_entry(
+    access_token: str, refresh_token: str, base_url: str, last_refresh: str
+) -> None:
+    """Mirror `hermes auth add xai-oauth`'s credential-pool insert.
+
+    Best-effort: the auth-store write in _save_xai_oauth_tokens is the source
+    of truth for runtime resolution; the pool entry only matters for the
+    rotation strategy.
+    """
+    try:
+        import uuid
+
+        from agent.credential_pool import (
+            PooledCredential,
+            load_pool,
+            AUTH_TYPE_OAUTH,
+            SOURCE_MANUAL,
+        )
+        pool = load_pool("xai-oauth")
+        existing = [
+            e for e in pool.entries()
+            if getattr(e, "source", "").startswith(f"{SOURCE_MANUAL}:dashboard_xai_pkce")
+        ]
+        for e in existing:
+            try:
+                pool.remove_entry(getattr(e, "id", ""))
+            except Exception:
+                pass
+        entry = PooledCredential(
+            provider="xai-oauth",
+            id=uuid.uuid4().hex[:6],
+            label="dashboard PKCE",
+            auth_type=AUTH_TYPE_OAUTH,
+            priority=0,
+            source=f"{SOURCE_MANUAL}:dashboard_xai_pkce",
+            access_token=access_token,
+            refresh_token=refresh_token,
+            base_url=base_url,
+            last_refresh=last_refresh,
+        )
+        pool.add_entry(entry)
+    except Exception as e:
+        _log.warning("xai-oauth pool add (dashboard) failed: %s", e)
+
+
 def _nous_poller(session_id: str) -> None:
     """Background poller that drives a Nous device-code flow to completion."""
     from hermes_cli.auth import (
@@ -3772,6 +4086,10 @@ async def start_oauth_login(provider_id: str, request: Request):
             return _start_anthropic_pkce()
         if catalog_entry["flow"] == "device_code":
             return await _start_device_code_flow(provider_id)
+        if catalog_entry["flow"] == "loopback" and provider_id == "xai-oauth":
+            return await asyncio.get_running_loop().run_in_executor(
+                None, _start_xai_loopback_flow
+            )
     except HTTPException:
         raise
     except Exception as e:
@@ -3798,7 +4116,13 @@ async def submit_oauth_code(provider_id: str, body: OAuthSubmitBody, request: Re
 
 @app.get("/api/providers/oauth/{provider_id}/poll/{session_id}")
 async def poll_oauth_session(provider_id: str, session_id: str):
-    """Poll a device-code session's status (no auth — read-only state)."""
+    """Poll a session's status (no auth — read-only state).
+
+    Shared by the device-code flows (Nous, OpenAI Codex, MiniMax) and the
+    loopback flow (xAI Grok). Both surface progress through the same
+    background-worker-updated ``status`` field, so a single poll endpoint
+    serves them all.
+    """
     with _oauth_sessions_lock:
         sess = _oauth_sessions.get(session_id)
     if not sess:
@@ -3821,7 +4145,625 @@ async def cancel_oauth_session(session_id: str, request: Request):
         sess = _oauth_sessions.pop(session_id, None)
     if sess is None:
         return {"ok": False, "message": "session not found"}
+    # Loopback sessions own a bound 127.0.0.1 callback server. Without an
+    # explicit shutdown the worker would keep that port held until
+    # _xai_wait_for_callback times out (up to 5 min). Free it immediately so
+    # an orphaned listener can't block a subsequent sign-in attempt.
+    if sess.get("flow") == "loopback":
+        # The worker is blocked in _xai_wait_for_callback, which polls
+        # callback_result rather than the server state. Flag the result as
+        # cancelled so that loop returns on its next tick instead of spinning
+        # until the timeout — otherwise repeated cancel/retry piles up daemon
+        # threads. (_cancelled() in the worker then short-circuits before any
+        # persist.)
+        result = sess.get("callback_result")
+        if isinstance(result, dict):
+            result["error"] = result.get("error") or "cancelled"
+        server = sess.get("server")
+        thread = sess.get("thread")
+        try:
+            if server is not None:
+                server.shutdown()
+                server.server_close()
+        except Exception:
+            pass
+        try:
+            if thread is not None:
+                thread.join(timeout=1.0)
+        except Exception:
+            pass
     return {"ok": True, "session_id": session_id}
+
+
+# ---------------------------------------------------------------------------
+# Memory Wiki endpoints
+# ---------------------------------------------------------------------------
+
+
+_MEMORY_WIKI_STOPWORDS = {
+    "a", "about", "an", "and", "are", "as", "at", "be", "by", "can", "for", "from", "get", "got",
+    "has", "have", "help", "how", "i", "in", "is", "it", "let", "lets", "me", "my", "of", "on", "or",
+    "our", "setup", "the", "this", "to", "up", "we", "web", "what", "with", "you",
+    # Dashboard/session mechanics are too generic to be useful wiki subjects.
+    "browse", "browser", "chat", "check", "create", "debug", "error", "fix", "fixed", "log", "logs",
+    "message", "messages", "open", "page", "query", "result", "results", "search", "session", "sessions",
+    "show", "test", "testing", "update", "use", "using",
+    "summarize", "summary", "daily", "internal", "cron",
+}
+
+_MEMORY_WIKI_DENY_PHRASES = {
+    "summarize hermes",
+    "summarize memory",
+    "memory daily",
+    "research top",
+    "able access",
+}
+
+
+def _memory_wiki_hidden_subjects_path() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "memory_wiki" / "hidden_subjects.json"
+
+
+def _memory_wiki_hidden_subjects() -> set[str]:
+    path = _memory_wiki_hidden_subjects_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return {_memory_wiki_slug(str(item)) for item in data if str(item).strip()}
+    except (OSError, json.JSONDecodeError):
+        pass
+    return set()
+
+
+def _memory_wiki_save_hidden_subjects(hidden: set[str]) -> None:
+    path = _memory_wiki_hidden_subjects_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(sorted(hidden), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _memory_wiki_is_internal_summary_text(text: str) -> bool:
+    compact = " ".join((text or "").lower().split())
+    return "summarize this hermes memory wiki daily log" in compact
+
+
+def _memory_wiki_date(timestamp: float) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(float(timestamp or 0)))
+
+
+def _memory_wiki_day_bounds(date: str) -> tuple[float, float]:
+    import datetime as _dt
+
+    try:
+        start = _dt.datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=_dt.timezone.utc)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Date must be YYYY-MM-DD")
+    return start.timestamp(), (start + _dt.timedelta(days=1)).timestamp()
+
+
+def _memory_wiki_slug(text: str) -> str:
+    import re as _re
+
+    slug = _re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+    return slug or "untitled"
+
+
+def _memory_wiki_title_from_slug(slug: str) -> str:
+    return " ".join(part.capitalize() for part in (slug or "").split("-") if part)
+
+
+def _memory_wiki_preview(text: str, limit: int = 180) -> str:
+    compact = " ".join((text or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 1].rstrip() + "…"
+
+
+def _memory_wiki_subject_for_text(text: str) -> tuple[str, str, list[str]] | None:
+    import re as _re
+
+    raw_text = text or ""
+    if _memory_wiki_is_internal_summary_text(raw_text):
+        return None
+    if _re.fullmatch(r"\d{8}(?:[_-][a-f0-9]{6,})?", raw_text.strip().lower()):
+        return None
+    words = [w.lower().strip("'") for w in _re.findall(r"[A-Za-z][A-Za-z0-9']*", raw_text)]
+    significant = [w for w in words if w not in _MEMORY_WIKI_STOPWORDS and len(w) > 2]
+    if len(significant) < 2:
+        return None
+
+    # Prefer the first meaningful phrase. Session titles tend to lead with
+    # the thing the user thinks the conversation was about, while later words
+    # are usually actions/details ("balance", "keepalive", "notes", etc.).
+    chosen: list[str] = []
+    for word in significant:
+        if word in chosen:
+            continue
+        chosen.append(word)
+        if len(chosen) == 2:
+            break
+    if len(chosen) < 2:
+        return None
+    phrase = " ".join(chosen)
+    if phrase in _MEMORY_WIKI_DENY_PHRASES:
+        return None
+    title = " ".join(part.capitalize() for part in chosen)
+    return _memory_wiki_slug(phrase), title, chosen
+
+
+def _memory_wiki_session_rows(db, *, limit: int = 500) -> list[dict[str, Any]]:
+    conn = getattr(db, "_conn", None)
+    if conn is None:
+        return db.list_sessions_rich(limit=limit, offset=0)
+    rows = conn.execute(
+        """
+        SELECT
+            s.id,
+            s.source,
+            s.model,
+            s.title,
+            s.started_at,
+            s.ended_at,
+            s.message_count,
+            COALESCE(m.last_active, s.started_at) AS last_active,
+            first_msg.content AS preview
+        FROM sessions s
+        LEFT JOIN (
+            SELECT session_id, MAX(timestamp) AS last_active
+            FROM messages
+            GROUP BY session_id
+        ) m ON m.session_id = s.id
+        LEFT JOIN messages first_msg ON first_msg.id = (
+            SELECT id FROM messages
+            WHERE session_id = s.id AND role IN ('user', 'assistant') AND content IS NOT NULL AND content != ''
+            ORDER BY timestamp ASC, id ASC
+            LIMIT 1
+        )
+        ORDER BY s.started_at DESC, s.id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _memory_wiki_message_rows(db, session_ids: list[str] | None = None, *, limit: int = 500) -> list[dict[str, Any]]:
+    conn = getattr(db, "_conn", None)
+    if conn is None:
+        return []
+    params: list[Any] = []
+    where = "WHERE m.content IS NOT NULL AND m.content != '' AND m.role IN ('user', 'assistant')"
+    if session_ids:
+        placeholders = ",".join("?" for _ in session_ids)
+        where += f" AND m.session_id IN ({placeholders})"
+        params.extend(session_ids)
+    params.append(limit)
+    rows = conn.execute(
+        f"""
+        SELECT
+            m.id,
+            m.session_id,
+            m.role,
+            m.content,
+            m.timestamp,
+            s.title AS session_title,
+            s.source,
+            s.started_at AS session_started
+        FROM messages m
+        JOIN sessions s ON s.id = m.session_id
+        {where}
+        ORDER BY m.timestamp DESC, m.id DESC
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _memory_wiki_cache_path(kind: str, key: str) -> Path:
+    from hermes_constants import get_hermes_home
+
+    safe_key = _memory_wiki_slug(key)
+    return get_hermes_home() / "memory_wiki" / kind / f"{safe_key}.json"
+
+
+def _memory_wiki_signature(payload: dict[str, Any]) -> str:
+    import hashlib as _hashlib
+
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return _hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _memory_wiki_cached_summary(kind: str, key: str, signature_payload: dict[str, Any], generator) -> dict[str, Any]:
+    signature = _memory_wiki_signature(signature_payload)
+    path = _memory_wiki_cache_path(kind, key)
+    try:
+        if path.exists():
+            cached = json.loads(path.read_text(encoding="utf-8"))
+            cached_summary = cached.get("summary")
+            if cached.get("signature") == signature and isinstance(cached_summary, dict):
+                return cached_summary
+            # Daily AI captain's logs should remain visible even when the
+            # underlying day receives a few new messages after manual backfill.
+            # The nightly/script generator overwrites this cache with a fresh
+            # signature; until then, prefer the readable AI log over falling
+            # back to the all-caps local extraction.
+            if kind == "days" and isinstance(cached_summary, dict):
+                generated_by = str(cached_summary.get("generated_by") or "")
+                if generated_by.startswith("ai-"):
+                    cached_summary["stale"] = True
+                    return cached_summary
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    summary = generator()
+    summary.setdefault("generated_at", time.time())
+    summary["cache_kind"] = kind
+    summary["cache_key"] = key
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"signature": signature, "summary": summary}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return summary
+
+
+def _memory_wiki_write_cached_summary(kind: str, key: str, signature_payload: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any]:
+    signature = _memory_wiki_signature(signature_payload)
+    path = _memory_wiki_cache_path(kind, key)
+    summary.setdefault("generated_at", time.time())
+    summary["cache_kind"] = kind
+    summary["cache_key"] = key
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"signature": signature, "summary": summary}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return summary
+
+
+def _memory_wiki_sentence_fragment(text: str, limit: int = 140) -> str:
+    fragment = _memory_wiki_preview(text, limit=limit)
+    return fragment.rstrip(". ")
+
+
+def _memory_wiki_normalize_ai_bullet(text: str, date: str) -> str | None:
+    import re as _re
+
+    bullet = _re.sub(r"^[-*•\d.)\s]+", "", (text or "").strip()).strip()
+    if not bullet:
+        return None
+    if bullet.startswith(f"{date} — "):
+        return bullet
+    if bullet.startswith(f"{date} - "):
+        return f"{date} — {bullet[len(date) + 3:].strip()}"
+    return f"{date} — {bullet}"
+
+
+def _memory_wiki_parse_ai_daily_summary(raw: str, date: str) -> dict[str, Any]:
+    import re as _re
+
+    bullets: list[str] = []
+    text = (raw or "").strip()
+    if text:
+        try:
+            parsed = json.loads(text)
+            candidate = parsed.get("bullets") if isinstance(parsed, dict) else parsed
+            if isinstance(candidate, list):
+                for item in candidate:
+                    normalized = _memory_wiki_normalize_ai_bullet(str(item), date)
+                    if normalized:
+                        bullets.append(normalized)
+        except json.JSONDecodeError:
+            pass
+    if not bullets:
+        for line in text.splitlines():
+            if _re.match(r"^\s*(?:[-*•]|\d+[.)])\s+", line):
+                normalized = _memory_wiki_normalize_ai_bullet(line, date)
+                if normalized:
+                    bullets.append(normalized)
+    if not bullets and text:
+        for sentence in _re.split(r"(?<=[.!?])\s+", text):
+            normalized = _memory_wiki_normalize_ai_bullet(sentence, date)
+            if normalized:
+                bullets.append(normalized)
+    return {
+        "headline": date,
+        "bullets": bullets[:7] or [f"{date} — No clear accomplishments or attempts were identified."],
+        "generated_by": "ai-daily-v1",
+    }
+
+
+def _memory_wiki_day_signature_payload(date: str, sessions: list[dict[str, Any]], summary: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "date": date,
+        "summary": summary,
+        "sessions": [
+            {
+                "id": s.get("id"),
+                "title": s.get("title"),
+                "message_count": s.get("message_count"),
+                "last_active": s.get("last_active"),
+                "preview": s.get("preview"),
+            }
+            for s in sessions
+        ],
+    }
+
+
+def _memory_wiki_day_summary(date: str, sessions: list[dict[str, Any]], summary: dict[str, Any]) -> dict[str, Any]:
+    def _generate() -> dict[str, Any]:
+        session_count = int(summary.get("session_count") or 0)
+        message_count = int(summary.get("message_count") or 0)
+        sources = summary.get("sources") or []
+        source_text = f" via {', '.join(sources)}" if sources else ""
+        headline = f"{date}: {session_count} session{'s' if session_count != 1 else ''}, {message_count} message{'s' if message_count != 1 else ''}{source_text}."
+        bullets = []
+        for session in sessions[:6]:
+            title = session.get("title") or session.get("id") or "Untitled session"
+            preview = _memory_wiki_sentence_fragment(session.get("preview") or "")
+            if preview:
+                bullets.append(f"{title}: {preview}")
+            else:
+                bullets.append(str(title))
+        if not bullets:
+            bullets.append("No readable session messages were captured for this day yet.")
+        return {
+            "headline": headline,
+            "bullets": bullets,
+            "generated_by": "local-extractive-v1",
+        }
+
+    signature_payload = _memory_wiki_day_signature_payload(date, sessions, summary)
+    return _memory_wiki_cached_summary("days", date, signature_payload, _generate)
+
+
+def _memory_wiki_subject_summary(title: str, slug: str, query_terms: list[str], sessions: list[dict[str, Any]], hits: list[dict[str, Any]], summary: dict[str, Any]) -> dict[str, Any]:
+    def _generate() -> dict[str, Any]:
+        session_count = int(summary.get("session_count") or 0)
+        message_count = int(summary.get("message_count") or 0)
+        headline = f"{title}: found across {session_count} session{'s' if session_count != 1 else ''} and {message_count} related message{'s' if message_count != 1 else ''}."
+        bullets: list[str] = []
+        for hit in hits[:6]:
+            content = _memory_wiki_sentence_fragment(hit.get("content") or "", limit=180)
+            if not content:
+                continue
+            session_title = hit.get("session_title") or hit.get("session_id") or "Session"
+            bullets.append(f"{session_title}: {content}")
+        if not bullets:
+            for session in sessions[:6]:
+                title_text = session.get("title") or session.get("id") or "Untitled session"
+                preview = _memory_wiki_sentence_fragment(session.get("preview") or "", limit=180)
+                bullets.append(f"{title_text}: {preview}" if preview else str(title_text))
+        if not bullets:
+            bullets.append("No readable message snippets were captured for this subject yet.")
+        return {
+            "headline": headline,
+            "bullets": bullets,
+            "generated_by": "local-extractive-v1",
+            "query_terms": query_terms,
+        }
+
+    signature_payload = {
+        "slug": slug,
+        "title": title,
+        "query_terms": query_terms,
+        "summary": summary,
+        "sessions": [
+            {
+                "id": s.get("id"),
+                "title": s.get("title"),
+                "message_count": s.get("message_count"),
+                "last_active": s.get("last_active"),
+                "preview": s.get("preview"),
+            }
+            for s in sessions
+        ],
+        "hits": [
+            {
+                "id": h.get("id"),
+                "session_id": h.get("session_id"),
+                "timestamp": h.get("timestamp"),
+                "content": h.get("content"),
+            }
+            for h in hits[:50]
+        ],
+    }
+    return _memory_wiki_cached_summary("subjects", slug, signature_payload, _generate)
+
+
+@app.get("/api/memory-wiki/days")
+async def get_memory_wiki_days(limit: int = 90):
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        buckets: dict[str, dict[str, Any]] = {}
+        for session in _memory_wiki_session_rows(db, limit=5000):
+            date = _memory_wiki_date(session.get("started_at") or 0)
+            bucket = buckets.setdefault(
+                date,
+                {"date": date, "session_count": 0, "message_count": 0, "sources": set(), "latest_at": 0},
+            )
+            bucket["session_count"] += 1
+            bucket["message_count"] += int(session.get("message_count") or 0)
+            if session.get("source"):
+                bucket["sources"].add(session["source"])
+            bucket["latest_at"] = max(float(bucket["latest_at"] or 0), float(session.get("last_active") or session.get("started_at") or 0))
+        days = sorted(buckets.values(), key=lambda item: item["date"], reverse=True)[:limit]
+        for day in days:
+            day["sources"] = sorted(day["sources"])
+        return {"days": days}
+    finally:
+        db.close()
+
+
+@app.get("/api/memory-wiki/days/{date}")
+async def get_memory_wiki_day(date: str):
+    from hermes_state import SessionDB
+
+    start, end = _memory_wiki_day_bounds(date)
+    db = SessionDB()
+    try:
+        sessions = [
+            session for session in _memory_wiki_session_rows(db, limit=5000)
+            if start <= float(session.get("started_at") or 0) < end
+        ]
+        sessions.sort(key=lambda item: float(item.get("started_at") or 0), reverse=True)
+        response_sessions = []
+        sources = set()
+        message_count = 0
+        for session in sessions:
+            sources.add(session.get("source"))
+            message_count += int(session.get("message_count") or 0)
+            response_sessions.append({
+                "id": session.get("id"),
+                "title": session.get("title") or session.get("id"),
+                "source": session.get("source"),
+                "model": session.get("model"),
+                "started_at": session.get("started_at"),
+                "last_active": session.get("last_active"),
+                "message_count": session.get("message_count") or 0,
+                "preview": _memory_wiki_preview(session.get("preview") or ""),
+            })
+        day_summary = {
+            "session_count": len(response_sessions),
+            "message_count": message_count,
+            "sources": sorted(s for s in sources if s),
+        }
+        return {
+            "date": date,
+            "summary": day_summary,
+            "wiki_summary": _memory_wiki_day_summary(date, response_sessions, day_summary),
+            "sessions": response_sessions,
+        }
+    finally:
+        db.close()
+
+
+def _memory_wiki_subject_index(db) -> dict[str, dict[str, Any]]:
+    subjects: dict[str, dict[str, Any]] = {}
+    session_by_id = {s.get("id"): s for s in _memory_wiki_session_rows(db, limit=5000)}
+    messages = _memory_wiki_message_rows(db, limit=20000)
+
+    for session in session_by_id.values():
+        candidate = _memory_wiki_subject_for_text(session.get("title") or session.get("preview") or session.get("id") or "")
+        if not candidate:
+            continue
+        slug, title, query_terms = candidate
+        entry = subjects.setdefault(slug, {"slug": slug, "title": title, "query_terms": query_terms, "session_ids": set(), "message_count": 0, "latest_at": 0})
+        entry["session_ids"].add(session.get("id"))
+        entry["latest_at"] = max(float(entry["latest_at"] or 0), float(session.get("last_active") or session.get("started_at") or 0))
+
+    for message in messages:
+        session = session_by_id.get(message.get("session_id"), {})
+        candidate = _memory_wiki_subject_for_text(session.get("title") or message.get("content") or "")
+        if not candidate:
+            continue
+        slug, title, query_terms = candidate
+        entry = subjects.setdefault(slug, {"slug": slug, "title": title, "query_terms": query_terms, "session_ids": set(), "message_count": 0, "latest_at": 0})
+        entry["session_ids"].add(message.get("session_id"))
+        entry["message_count"] += 1
+        entry["latest_at"] = max(float(entry["latest_at"] or 0), float(message.get("timestamp") or 0))
+
+    return subjects
+
+
+@app.get("/api/memory-wiki/subjects")
+async def get_memory_wiki_subjects(limit: int = 100):
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        subjects = []
+        hidden = _memory_wiki_hidden_subjects()
+        for entry in _memory_wiki_subject_index(db).values():
+            if entry["slug"] in hidden:
+                continue
+            subjects.append({
+                "slug": entry["slug"],
+                "title": entry["title"],
+                "query_terms": entry.get("query_terms") or [],
+                "session_count": len(entry["session_ids"]),
+                "message_count": entry["message_count"],
+                "latest_at": entry["latest_at"],
+            })
+        subjects.sort(key=lambda item: (item["session_count"], item["message_count"], item["latest_at"]), reverse=True)
+        return {"subjects": subjects[:limit]}
+    finally:
+        db.close()
+
+
+@app.post("/api/memory-wiki/subjects/{slug}/hide")
+async def hide_memory_wiki_subject(slug: str):
+    safe_slug = _memory_wiki_slug(slug)
+    hidden = _memory_wiki_hidden_subjects()
+    hidden.add(safe_slug)
+    _memory_wiki_save_hidden_subjects(hidden)
+    return {"slug": safe_slug, "hidden": True}
+
+
+@app.get("/api/memory-wiki/subjects/{slug}")
+async def get_memory_wiki_subject(slug: str):
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        subjects = _memory_wiki_subject_index(db)
+        entry = subjects.get(slug)
+        if not entry or slug in _memory_wiki_hidden_subjects():
+            raise HTTPException(status_code=404, detail="Subject not found")
+        session_ids = sorted(entry["session_ids"])
+        sessions_by_id = {s.get("id"): s for s in _memory_wiki_session_rows(db, limit=5000) if s.get("id") in session_ids}
+        sessions = []
+        for sid in session_ids:
+            session = sessions_by_id.get(sid)
+            if not session:
+                continue
+            sessions.append({
+                "id": sid,
+                "title": session.get("title") or sid,
+                "source": session.get("source"),
+                "started_at": session.get("started_at"),
+                "last_active": session.get("last_active"),
+                "message_count": session.get("message_count") or 0,
+                "preview": _memory_wiki_preview(session.get("preview") or ""),
+            })
+        sessions.sort(key=lambda item: float(item.get("last_active") or item.get("started_at") or 0), reverse=True)
+        query_terms = entry.get("query_terms") or [part.lower() for part in entry["title"].split()]
+        hits = []
+        for message in _memory_wiki_message_rows(db, session_ids=session_ids, limit=500):
+            content_lc = (message.get("content") or "").lower()
+            if query_terms and not all(term in content_lc for term in query_terms):
+                # Keep session-level matches even when only the title mentions the subject,
+                # but prioritize direct message hits for the detail view.
+                continue
+            hits.append({
+                "id": message.get("id"),
+                "session_id": message.get("session_id"),
+                "role": message.get("role"),
+                "content": _memory_wiki_preview(message.get("content") or "", limit=500),
+                "timestamp": message.get("timestamp"),
+                "session_title": message.get("session_title"),
+                "source": message.get("source"),
+            })
+        subject_summary = {
+            "session_count": len(sessions),
+            "message_count": entry["message_count"],
+            "latest_at": entry["latest_at"],
+        }
+        return {
+            "slug": slug,
+            "title": entry["title"],
+            "query_terms": query_terms,
+            "summary": subject_summary,
+            "wiki_summary": _memory_wiki_subject_summary(entry["title"], slug, query_terms, sessions, hits, subject_summary),
+            "sessions": sessions,
+            "message_hits": hits[:50],
+        }
+    finally:
+        db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -4253,6 +5195,8 @@ class CronJobCreate(BaseModel):
     schedule: str
     name: str = ""
     deliver: str = "local"
+    model: Optional[str] = None
+    provider: Optional[str] = None
 
 
 class CronJobUpdate(BaseModel):
@@ -4287,12 +5231,61 @@ def _cron_profile_home(profile: Optional[str]) -> Tuple[str, Path]:
     return canon, profiles_mod.get_profile_dir(canon)
 
 
+def _cron_profile_config_and_default_model(home: Path) -> Tuple[Dict[str, Any], str, str]:
+    """Return (config, provider, model) configured for a profile, best-effort."""
+    try:
+        import yaml
+
+        cfg_path = home / "config.yaml"
+        cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
+    except Exception:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    model_cfg = cfg.get("model") or {}
+    if isinstance(model_cfg, str):
+        return cfg, "", model_cfg
+    if isinstance(model_cfg, dict):
+        provider = str(model_cfg.get("provider") or "").strip()
+        model = str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
+        return cfg, provider, model
+    return cfg, "", ""
+
+
+def _cron_profile_default_model(home: Path) -> Tuple[str, str]:
+    """Return (provider, model) configured for a profile, best-effort."""
+    _, provider, model = _cron_profile_config_and_default_model(home)
+    return provider, model
+
+
 def _annotate_cron_job(job: Dict[str, Any], profile: str, home: Path) -> Dict[str, Any]:
     annotated = dict(job)
     annotated["profile"] = profile
     annotated["profile_name"] = profile
     annotated["hermes_home"] = str(home)
     annotated["is_default_profile"] = profile == "default"
+
+    explicit_provider = str(job.get("provider") or "").strip()
+    explicit_model = str(job.get("model") or "").strip()
+    cfg, default_provider, default_model = _cron_profile_config_and_default_model(home)
+    routed_provider = default_provider
+    routed_model = default_model
+    routing_class = "default"
+    routing_reason = "default model"
+    try:
+        from hermes_cli.model_routing import route_model_for_task
+        routed = route_model_for_task(job=job, config=cfg)
+        routed_provider = routed.provider or routed_provider
+        routed_model = routed.model or routed_model
+        routing_class = routed.task_class
+        routing_reason = routed.reason
+    except Exception:
+        pass
+    annotated["uses_default_model"] = not bool(explicit_model or explicit_provider) and routed_model == default_model
+    annotated["effective_provider"] = explicit_provider or routed_provider
+    annotated["effective_model"] = explicit_model or routed_model
+    annotated["routing_class"] = job.get("routing_class") or routing_class
+    annotated["routing_reason"] = routing_reason
     return annotated
 
 
@@ -4378,6 +5371,8 @@ async def create_cron_job(body: CronJobCreate, profile: str = "default"):
             schedule=body.schedule,
             name=body.name,
             deliver=body.deliver,
+            model=body.model,
+            provider=body.provider,
         )
     except Exception as e:
         _log.exception("POST /api/cron/jobs failed")
@@ -6094,6 +7089,18 @@ async def get_models_analytics(days: int = 30):
     try:
         cutoff = time.time() - (days * 86400)
 
+        from datetime import datetime, time as dt_time, timedelta
+        try:
+            from zoneinfo import ZoneInfo
+            local_tz = ZoneInfo(os.environ.get("TZ") or "Europe/Prague")
+        except Exception:
+            local_tz = None
+        now_local = datetime.now(local_tz) if local_tz else datetime.now().astimezone()
+        today_start_local = datetime.combine(now_local.date(), dt_time(4, 0), tzinfo=now_local.tzinfo)
+        if now_local < today_start_local:
+            today_start_local -= timedelta(days=1)
+        today_cutoff = today_start_local.timestamp()
+
         cur = db._conn.execute("""
             SELECT model,
                    billing_provider,
@@ -6114,10 +7121,37 @@ async def get_models_analytics(days: int = 30):
         """, (cutoff,))
         rows = [dict(r) for r in cur.fetchall()]
 
-        models = []
-        for row in rows:
-            provider = row.get("billing_provider") or ""
-            model_name = row["model"]
+        def _usage_by_model(where_sql: str, params: tuple) -> dict[tuple[str, str], dict]:
+            usage_cur = db._conn.execute(f"""
+                SELECT model,
+                       billing_provider,
+                       COALESCE(SUM(input_tokens), 0) as input_tokens,
+                       COALESCE(SUM(output_tokens), 0) as output_tokens,
+                       COALESCE(SUM(cache_read_tokens), 0) as cache_read_tokens,
+                       COALESCE(SUM(reasoning_tokens), 0) as reasoning_tokens
+                FROM sessions
+                WHERE {where_sql} AND model IS NOT NULL AND model != ''
+                GROUP BY model, billing_provider
+            """, params)
+            return {
+                (r["model"], r["billing_provider"] or ""): dict(r)
+                for r in usage_cur.fetchall()
+            }
+
+        lifetime_usage = _usage_by_model("1=1", ())
+        today_usage = _usage_by_model("started_at >= ?", (today_cutoff,))
+
+        def _total_tokens(row: dict | None) -> int:
+            if not row:
+                return 0
+            return (
+                int(row.get("input_tokens") or 0)
+                + int(row.get("output_tokens") or 0)
+                + int(row.get("cache_read_tokens") or 0)
+                + int(row.get("reasoning_tokens") or 0)
+            )
+
+        def _capabilities(provider: str, model_name: str) -> dict:
             caps = {}
             try:
                 from agent.models_dev import get_model_capabilities
@@ -6133,6 +7167,64 @@ async def get_models_analytics(days: int = 30):
                     }
             except Exception:
                 pass
+            return caps
+
+        def _known_configured_models() -> set[tuple[str, str]]:
+            """Models configured on cron/model routing should appear before much usage accrues."""
+            known: set[tuple[str, str]] = set()
+            try:
+                from cron.jobs import list_jobs
+                for job in list_jobs(include_disabled=True):
+                    model_name = str(job.get("model") or "").strip()
+                    provider = str(job.get("provider") or "").strip()
+                    if model_name:
+                        known.add((model_name, provider))
+            except Exception:
+                pass
+            try:
+                cfg = load_config()
+                routing = cfg.get("model_routing") if isinstance(cfg, dict) else None
+                if isinstance(routing, dict):
+                    for key in ("default_model", "cheap_model", "critical_model"):
+                        entry = routing.get(key)
+                        if isinstance(entry, dict):
+                            model_name = str(entry.get("model") or "").strip()
+                            provider = str(entry.get("provider") or "").strip()
+                            if model_name:
+                                known.add((model_name, provider))
+            except Exception:
+                pass
+            return known
+
+        def _empty_row(model_name: str, provider: str) -> dict:
+            return {
+                "model": model_name,
+                "billing_provider": provider,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "reasoning_tokens": 0,
+                "estimated_cost": 0,
+                "actual_cost": 0,
+                "sessions": 0,
+                "api_calls": 0,
+                "tool_calls": 0,
+                "last_used_at": None,
+                "avg_tokens_per_session": 0,
+            }
+
+        row_by_key = {(r["model"], r.get("billing_provider") or ""): r for r in rows}
+        for key in sorted(_known_configured_models()):
+            row_by_key.setdefault(key, _empty_row(*key))
+
+        models = []
+        for row in row_by_key.values():
+            provider = row.get("billing_provider") or ""
+            model_name = row["model"]
+            key = (model_name, provider)
+            lifetime = lifetime_usage.get(key)
+            today = today_usage.get(key)
+            caps = _capabilities(provider, model_name)
 
             models.append({
                 "model": model_name,
@@ -6148,8 +7240,24 @@ async def get_models_analytics(days: int = 30):
                 "tool_calls": row["tool_calls"],
                 "last_used_at": row["last_used_at"],
                 "avg_tokens_per_session": row["avg_tokens_per_session"],
+                "tokens_to_date": _total_tokens(lifetime),
+                "today_input_tokens": int(today.get("input_tokens") or 0) if today else 0,
+                "today_output_tokens": int(today.get("output_tokens") or 0) if today else 0,
+                "today_cache_read_tokens": int(today.get("cache_read_tokens") or 0) if today else 0,
+                "today_reasoning_tokens": int(today.get("reasoning_tokens") or 0) if today else 0,
+                "today_total_tokens": _total_tokens(today),
+                "today_started_at": today_cutoff,
                 "capabilities": caps,
             })
+
+        models.sort(
+            key=lambda m: (
+                int(m.get("tokens_to_date") or 0),
+                int(m.get("today_total_tokens") or 0),
+                int(m.get("input_tokens") or 0) + int(m.get("output_tokens") or 0),
+            ),
+            reverse=True,
+        )
 
         totals_cur = db._conn.execute("""
             SELECT COUNT(DISTINCT model) as distinct_models,
@@ -6164,6 +7272,31 @@ async def get_models_analytics(days: int = 30):
             FROM sessions WHERE started_at > ? AND model IS NOT NULL AND model != ''
         """, (cutoff,))
         totals = dict(totals_cur.fetchone())
+        totals["distinct_models"] = len(models)
+
+        lifetime_totals_cur = db._conn.execute("""
+            SELECT COALESCE(SUM(input_tokens), 0) as input_tokens,
+                   COALESCE(SUM(output_tokens), 0) as output_tokens,
+                   COALESCE(SUM(cache_read_tokens), 0) as cache_read_tokens,
+                   COALESCE(SUM(reasoning_tokens), 0) as reasoning_tokens
+            FROM sessions WHERE model IS NOT NULL AND model != ''
+        """)
+        today_totals_cur = db._conn.execute("""
+            SELECT COALESCE(SUM(input_tokens), 0) as input_tokens,
+                   COALESCE(SUM(output_tokens), 0) as output_tokens,
+                   COALESCE(SUM(cache_read_tokens), 0) as cache_read_tokens,
+                   COALESCE(SUM(reasoning_tokens), 0) as reasoning_tokens
+            FROM sessions WHERE started_at >= ? AND model IS NOT NULL AND model != ''
+        """, (today_cutoff,))
+        lifetime_totals = dict(lifetime_totals_cur.fetchone())
+        today_totals = dict(today_totals_cur.fetchone())
+        totals["tokens_to_date"] = _total_tokens(lifetime_totals)
+        totals["today_input_tokens"] = int(today_totals.get("input_tokens") or 0)
+        totals["today_output_tokens"] = int(today_totals.get("output_tokens") or 0)
+        totals["today_cache_read_tokens"] = int(today_totals.get("cache_read_tokens") or 0)
+        totals["today_reasoning_tokens"] = int(today_totals.get("reasoning_tokens") or 0)
+        totals["today_total_tokens"] = _total_tokens(today_totals)
+        totals["today_started_at"] = today_cutoff
 
         return {
             "models": models,
@@ -6276,13 +7409,26 @@ def _ws_host_origin_is_allowed(ws: "WebSocket") -> bool:
 
     parsed = urllib.parse.urlparse(origin)
     if parsed.scheme not in {"http", "https"}:
-        # Packaged Electron loads the desktop renderer over file://, so its
-        # WebSocket handshake carries a non-web Origin such as file:// or null.
-        # DNS-rebinding attacks originate from an http(s) site; they cannot
-        # forge a file:// origin and still hold the loopback session token.
-        # Public/gated binds have no legitimate non-web client, so keep
-        # rejecting these origins there.
-        return bound_host.lower() in _LOOPBACK_HOST_VALUES
+        # Packaged Electron loads the desktop renderer over a non-web origin
+        # such as file://, null, or a custom app:// scheme. This helper is
+        # called only AFTER _ws_auth_ok has already accepted the WS credential,
+        # which is the real auth boundary in every mode:
+        #   * loopback bind          → legacy dashboard session token
+        #   * non-loopback --insecure → legacy session token (Tailscale / LAN)
+        #   * OAuth-gated public bind → single-use, 30s-TTL, identity-bound
+        #     ?ticket= minted at the cookie-authed POST /api/auth/ws-ticket
+        # A non-web origin can only be produced by a native client (the desktop
+        # shell); a DNS-rebinding attack always arrives from an http(s) origin
+        # and is still match-checked against the bound host below. So once the
+        # credential check upstream has passed, the Origin guard adds nothing
+        # for a non-web origin — trust it in every mode.
+        #
+        # (Earlier revisions restricted this to loopback, then to non-gated
+        # binds; both excluded the packaged desktop talking to a remote
+        # OAuth-gated gateway, whose file:// renderer origin then got rejected
+        # at the WS upgrade even with a valid ticket. The ticket is the gate,
+        # not the origin.)
+        return True
 
     if not parsed.netloc:
         return False
@@ -6301,10 +7447,21 @@ def _ws_auth_ok(ws: "WebSocket") -> bool:
     Loopback / ``--insecure``: legacy ``?token=<_SESSION_TOKEN>`` query
     parameter, constant-time compared.
 
-    Gated (public bind, no ``--insecure``): ``?ticket=<single-use>`` query
-    parameter consumed against the dashboard-auth ticket store. The legacy
-    token path is unconditionally rejected in this mode (the SPA bundle
-    isn't carrying the token any longer).
+    Gated (public bind, no ``--insecure``): one of two credentials —
+
+    * ``?ticket=<single-use>`` — a browser-minted, single-use, 30s-TTL ticket
+      consumed against the dashboard-auth ticket store. This is what the SPA
+      (and native clients) use.
+    * ``?internal=<process-credential>`` — the process-lifetime internal
+      credential, used only by WS clients the server spawns itself (the
+      embedded-TUI PTY child attaching to ``/api/ws`` and ``/api/pub``). It
+      is multi-use and never expires so the child can reconnect, and is never
+      injected into the SPA — see ``dashboard_auth.ws_tickets`` for the
+      threat model.
+
+    The legacy ``?token=`` path is unconditionally rejected in gated mode
+    (the SPA bundle isn't carrying the token any longer, and a leaked
+    ``_SESSION_TOKEN`` must not grant WS access once the gate is engaged).
 
     Returns True if the WS should be accepted; callers close with the
     appropriate WS code (4401) on False. Audit-logs the rejection so
@@ -6312,16 +7469,35 @@ def _ws_auth_ok(ws: "WebSocket") -> bool:
     """
     auth_required = bool(getattr(app.state, "auth_required", False))
     if auth_required:
-        ticket = ws.query_params.get("ticket", "")
-        if not ticket:
-            return False
         # Lazy import — keeps this function importable in test harnesses
         # that don't bring in the dashboard_auth layer.
         from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
         from hermes_cli.dashboard_auth.ws_tickets import (
             TicketInvalid,
+            consume_internal_credential,
             consume_ticket,
         )
+
+        # Server-spawned children (PTY child → /api/ws, /api/pub) present the
+        # multi-use internal credential rather than a single-use ticket, so
+        # they survive reconnects and slow cold boots.
+        internal = ws.query_params.get("internal", "")
+        if internal:
+            try:
+                consume_internal_credential(internal)
+                return True
+            except TicketInvalid as exc:
+                audit_log(
+                    AuditEvent.WS_TICKET_REJECTED,
+                    reason=f"internal: {exc}",
+                    ip=(ws.client.host if ws.client else ""),
+                    path=ws.url.path,
+                )
+                return False
+
+        ticket = ws.query_params.get("ticket", "")
+        if not ticket:
+            return False
 
         try:
             consume_ticket(ticket)
@@ -6342,8 +7518,7 @@ def _ws_auth_ok(ws: "WebSocket") -> bool:
 # and /api/events (dashboard → browser sidebar).  Keyed by an opaque channel id
 # the chat tab generates on mount; entries auto-evict when the last subscriber
 # drops AND the publisher has disconnected.
-_event_channels: dict[str, set] = {}
-_event_lock = asyncio.Lock()
+# (State is initialised in _lifespan on app startup — see above.)
 
 
 def _resolve_chat_argv(
@@ -6399,7 +7574,16 @@ def _resolve_chat_argv(
 
 
 def _build_gateway_ws_url() -> Optional[str]:
-    """ws:// URL the PTY child should attach to for JSON-RPC gateway traffic."""
+    """ws:// URL the PTY child should attach to for JSON-RPC gateway traffic.
+
+    Loopback / ``--insecure``: ``?token=<_SESSION_TOKEN>``.
+
+    Gated mode: the legacy token path is rejected by ``_ws_auth_ok``, so the
+    server-spawned PTY child authenticates with the process-lifetime internal
+    credential (``?internal=``). It must NOT use a single-use browser ticket:
+    the child reads this URL once at startup and reuses it on every reconnect,
+    and a 30s-TTL ticket can expire before a slow cold boot even dials.
+    """
     host = getattr(app.state, "bound_host", None)
     port = getattr(app.state, "bound_port", None)
 
@@ -6411,7 +7595,13 @@ def _build_gateway_ws_url() -> Optional[str]:
         if ":" in host and not host.startswith("[")
         else f"{host}:{port}"
     )
-    qs = urllib.parse.urlencode({"token": _SESSION_TOKEN})
+
+    if getattr(app.state, "auth_required", False):
+        from hermes_cli.dashboard_auth.ws_tickets import internal_ws_credential
+
+        qs = urllib.parse.urlencode({"internal": internal_ws_credential()})
+    else:
+        qs = urllib.parse.urlencode({"token": _SESSION_TOKEN})
 
     return f"ws://{netloc}/api/ws?{qs}"
 
@@ -6421,16 +7611,14 @@ def _build_sidecar_url(channel: str) -> Optional[str]:
 
     Loopback / ``--insecure``: uses ``?token=<_SESSION_TOKEN>``.
 
-    Gated mode: mints a single-use ticket via the dashboard-auth ticket
-    store (server-side mint, no HTTP round trip — the PTY child is a
-    server-spawned process and we trust it). The ticket binds to the
-    pseudo-user ``"pty-sidecar"`` so audit logs can distinguish these from
-    browser-initiated tickets.
-
-    The single-use lifetime means the PTY child cannot reconnect without a
-    new sidecar URL. PTY children open ``/api/pub`` once at startup; if
-    reconnect semantics ever become important, this should be upgraded to
-    a long-lived process-scoped token.
+    Gated mode: authenticates with the process-lifetime internal credential
+    (``?internal=``), the same one ``_build_gateway_ws_url`` uses. The PTY
+    child is a server-spawned process we trust; the credential is multi-use
+    and never expires, so the child can reconnect ``/api/pub`` without a new
+    URL. (This previously minted a single-use 30s ticket, which meant the
+    child could not reconnect and could miss the window on a slow cold boot.)
+    Connections authenticated this way are recorded under the
+    ``server-internal`` identity in the audit log.
     """
     host = getattr(app.state, "bound_host", None)
     port = getattr(app.state, "bound_port", None)
@@ -6441,21 +7629,24 @@ def _build_sidecar_url(channel: str) -> Optional[str]:
     netloc = f"[{host}]:{port}" if ":" in host and not host.startswith("[") else f"{host}:{port}"
 
     if getattr(app.state, "auth_required", False):
-        # Gated mode — mint a ticket so the WS upgrade survives _ws_auth_ok.
-        from hermes_cli.dashboard_auth.ws_tickets import mint_ticket
+        # Gated mode — use the internal credential so the WS upgrade survives
+        # _ws_auth_ok and the child can reconnect.
+        from hermes_cli.dashboard_auth.ws_tickets import internal_ws_credential
 
-        ticket = mint_ticket(user_id="pty-sidecar", provider="server-internal")
-        qs = urllib.parse.urlencode({"ticket": ticket, "channel": channel})
+        qs = urllib.parse.urlencode(
+            {"internal": internal_ws_credential(), "channel": channel}
+        )
     else:
         qs = urllib.parse.urlencode({"token": _SESSION_TOKEN, "channel": channel})
 
     return f"ws://{netloc}/api/pub?{qs}"
 
 
-async def _broadcast_event(channel: str, payload: str) -> None:
+async def _broadcast_event(app: Any, channel: str, payload: str) -> None:
     """Fan out one publisher frame to every subscriber on `channel`."""
-    async with _event_lock:
-        subs = list(_event_channels.get(channel, ()))
+    event_channels, event_lock = _get_event_state(app)
+    async with event_lock:
+        subs = list(event_channels.get(channel, ()))
 
     for sub in subs:
         try:
@@ -6646,7 +7837,7 @@ async def pub_ws(ws: WebSocket) -> None:
 
     try:
         while True:
-            await _broadcast_event(channel, await ws.receive_text())
+            await _broadcast_event(ws.app, channel, await ws.receive_text())
     except WebSocketDisconnect:
         pass
 
@@ -6672,8 +7863,9 @@ async def events_ws(ws: WebSocket) -> None:
 
     await ws.accept()
 
-    async with _event_lock:
-        _event_channels.setdefault(channel, set()).add(ws)
+    event_channels, event_lock = _get_event_state(ws.app)
+    async with event_lock:
+        event_channels.setdefault(channel, set()).add(ws)
 
     try:
         while True:
@@ -6684,14 +7876,14 @@ async def events_ws(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     finally:
-        async with _event_lock:
-            subs = _event_channels.get(channel)
+        async with event_lock:
+            subs = event_channels.get(channel)
 
             if subs is not None:
                 subs.discard(ws)
 
                 if not subs:
-                    _event_channels.pop(channel, None)
+                    event_channels.pop(channel, None)
 
 
 def _normalise_prefix(raw: Optional[str]) -> str:

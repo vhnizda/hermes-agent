@@ -211,7 +211,7 @@ function UseAsMenu({
   const [error, setError] = useState<string | null>(null);
 
   const assign = async (
-    scope: "main" | "auxiliary",
+    scope: "main" | "auxiliary" | "routing",
     task: string,
   ) => {
     if (!provider || !model) {
@@ -271,6 +271,18 @@ function UseAsMenu({
                 current
               </span>
             )}
+          </button>
+
+          <div className="border-t border-border/50 px-3 py-1.5 text-display text-xs tracking-wider text-text-tertiary">
+            Router
+          </div>
+          <button
+            type="button"
+            onClick={() => assign("routing", "cheap")}
+            disabled={busy}
+            className="flex w-full items-center justify-between px-3 py-1.5 text-xs uppercase hover:bg-muted/50 disabled:opacity-40"
+          >
+            <span>Cheap/simple model</span>
           </button>
 
           <div className="border-t border-border/50 px-3 py-1.5 text-display text-xs tracking-wider text-text-tertiary">
@@ -335,7 +347,6 @@ function ModelCard({
 }) {
   const { t } = useI18n();
   const provider = entry.provider || modelVendor(entry.model);
-  const totalTokens = entry.input_tokens + entry.output_tokens;
   const caps = entry.capabilities;
 
   const isMain =
@@ -393,18 +404,25 @@ function ModelCard({
             </div>
           </div>
           <div className="flex flex-col items-end gap-1 shrink-0">
-            {showTokens ? (
-              <div className="text-right">
+            <div className="text-right space-y-1">
+              <div>
                 <div className="text-xs font-mono font-semibold">
-                  {formatTokens(totalTokens)}
+                  {formatTokens(entry.tokens_to_date)}
                 </div>
                 <div className="text-xs text-text-tertiary">
                   {t.models.tokens}
                 </div>
               </div>
-            ) : (
-              entry.sessions > 0 && (
-                <div className="text-right">
+              <div>
+                <div className="text-xs font-mono font-semibold text-primary">
+                  {formatTokens(entry.today_total_tokens)}
+                </div>
+                <div className="text-[10px] text-muted-foreground">
+                  Today's usage
+                </div>
+              </div>
+              {entry.sessions > 0 && (
+                <div>
                   <div className="text-xs font-mono font-semibold">
                     {entry.sessions}
                   </div>
@@ -412,8 +430,8 @@ function ModelCard({
                     {t.models.sessions}
                   </div>
                 </div>
-              )
-            )}
+              )}
+            </div>
             <UseAsMenu
               provider={provider}
               model={entry.model}
@@ -667,7 +685,7 @@ function ModelSettingsPanel({
     provider,
     model,
   }: {
-    scope: "main" | "auxiliary";
+    scope: "main" | "auxiliary" | "routing";
     task: string;
     provider: string;
     model: string;
@@ -718,6 +736,37 @@ function ModelSettingsPanel({
           </Button>
         </div>
 
+        {/* Conservative router row */}
+        <div className="flex min-w-0 flex-col gap-2 bg-muted/20 border border-border/50 px-3 py-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2 mb-0.5">
+              <Zap className="h-3 w-3 text-amber-500" />
+              <span className="text-xs font-medium uppercase tracking-wider">
+                Conservative router
+              </span>
+              <Badge tone={aux?.routing?.enabled ? "secondary" : "outline"} className="text-[9px]">
+                {aux?.routing?.enabled ? "enabled" : "off"}
+              </Badge>
+            </div>
+            <div className="text-xs font-mono text-muted-foreground truncate">
+              cheap/simple: {aux?.routing?.cheap_model?.provider || "(unset)"}
+              {aux?.routing?.cheap_model?.provider && aux?.routing?.cheap_model?.model && " · "}
+              {aux?.routing?.cheap_model?.model || "(unset)"}
+            </div>
+            <div className="text-[10px] text-muted-foreground/70">
+              Policy: {aux?.routing?.policy || "conservative"}; main chat remains on the main model.
+            </div>
+          </div>
+          <Button
+            size="sm"
+            outlined
+            onClick={() => setPicker({ kind: "aux", task: "__routing_cheap__" })}
+            className="shrink-0 self-start text-xs sm:self-center"
+          >
+            Set cheap
+          </Button>
+        </div>
+
         {/* Auxiliary tasks summary + open modal */}
         <div className="flex min-w-0 flex-col gap-2 bg-muted/20 border border-border/50 px-3 py-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
           <div className="min-w-0 flex-1">
@@ -748,11 +797,12 @@ function ModelSettingsPanel({
             key={`picker-${refreshKey}`}
             loader={api.getModelOptions}
             alwaysGlobal
-            title="Set Main Model"
+            title={picker.kind === "aux" && picker.task === "__routing_cheap__" ? "Set Cheap/Simple Router Model" : "Set Main Model"}
             onApply={async ({ provider, model }) => {
+              const isRoutingCheap = picker.kind === "aux" && picker.task === "__routing_cheap__";
               await applyAssignment({
-                scope: "main",
-                task: "",
+                scope: isRoutingCheap ? "routing" : "main",
+                task: isRoutingCheap ? "cheap" : "",
                 provider,
                 model,
               });
@@ -897,9 +947,17 @@ export default function ModelsPage() {
                           value: String(data.totals.distinct_models),
                         },
                         {
+                          label: "Tokens to date",
+                          value: formatTokens(data.totals.tokens_to_date),
+                        },
+                        {
+                          label: "Today's usage",
+                          value: formatTokens(data.totals.today_total_tokens),
+                        },
+                        {
                           label: t.analytics.totalTokens,
                           value: formatTokens(
-                            data.totals.total_input + data.totals.total_output,
+                            data.totals.total_input + data.totals.total_output + data.totals.total_cache_read + data.totals.total_reasoning,
                           ),
                         },
                         {

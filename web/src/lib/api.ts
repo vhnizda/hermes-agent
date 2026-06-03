@@ -228,6 +228,8 @@ export const api = {
     }),
   getSessions: (limit = 20, offset = 0) =>
     fetchJSON<PaginatedSessions>(`/api/sessions?limit=${limit}&offset=${offset}`),
+  getSession: (id: string) =>
+    fetchJSON<SessionInfo>(`/api/sessions/${encodeURIComponent(id)}`),
   getSessionMessages: (id: string) =>
     fetchJSON<SessionMessagesResponse>(`/api/sessions/${encodeURIComponent(id)}/messages`),
   getSessionLatestDescendant: (id: string) =>
@@ -333,7 +335,7 @@ export const api = {
   // Cron jobs
   getCronJobs: (profile = "all") =>
     fetchJSON<CronJob[]>(`/api/cron/jobs?profile=${encodeURIComponent(profile)}`),
-  createCronJob: (job: { prompt: string; schedule: string; name?: string; deliver?: string }, profile = "default") =>
+  createCronJob: (job: { prompt: string; schedule: string; name?: string; deliver?: string; model?: string; provider?: string }, profile = "default") =>
     fetchJSON<CronJob>(`/api/cron/jobs?profile=${encodeURIComponent(profile)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -415,6 +417,18 @@ export const api = {
   // Session search (FTS5)
   searchSessions: (q: string) =>
     fetchJSON<SessionSearchResponse>(`/api/sessions/search?q=${encodeURIComponent(q)}`),
+
+  // Memory Wiki
+  getMemoryWikiDays: () => fetchJSON<MemoryWikiDaysResponse>("/api/memory-wiki/days"),
+  getMemoryWikiDay: (date: string) =>
+    fetchJSON<MemoryWikiDayDetail>(`/api/memory-wiki/days/${encodeURIComponent(date)}`),
+  getMemoryWikiSubjects: () => fetchJSON<MemoryWikiSubjectsResponse>("/api/memory-wiki/subjects"),
+  getMemoryWikiSubject: (slug: string) =>
+    fetchJSON<MemoryWikiSubjectDetail>(`/api/memory-wiki/subjects/${encodeURIComponent(slug)}`),
+  hideMemoryWikiSubject: (slug: string) =>
+    fetchJSON<{ slug: string; hidden: boolean }>(`/api/memory-wiki/subjects/${encodeURIComponent(slug)}/hide`, {
+      method: "POST",
+    }),
 
   // OAuth provider management
   getOAuthProviders: () =>
@@ -1173,6 +1187,87 @@ export interface SessionMessagesResponse {
   messages: SessionMessage[];
 }
 
+export interface MemoryWikiDayEntry {
+  date: string;
+  session_count: number;
+  message_count: number;
+  sources: string[];
+  latest_at: number;
+}
+
+export interface MemoryWikiDaysResponse {
+  days: MemoryWikiDayEntry[];
+}
+
+export interface MemoryWikiSessionSummary {
+  id: string;
+  title: string;
+  source: string | null;
+  model?: string | null;
+  started_at: number;
+  last_active: number;
+  message_count: number;
+  preview: string;
+}
+
+export interface MemoryWikiCachedSummary {
+  headline: string;
+  bullets: string[];
+  generated_by: string;
+  generated_at: number;
+  cache_kind: string;
+  cache_key: string;
+  query_terms?: string[];
+}
+
+export interface MemoryWikiDayDetail {
+  date: string;
+  summary: {
+    session_count: number;
+    message_count: number;
+    sources: string[];
+  };
+  wiki_summary: MemoryWikiCachedSummary;
+  sessions: MemoryWikiSessionSummary[];
+}
+
+export interface MemoryWikiSubjectEntry {
+  slug: string;
+  title: string;
+  query_terms: string[];
+  session_count: number;
+  message_count: number;
+  latest_at: number;
+}
+
+export interface MemoryWikiSubjectsResponse {
+  subjects: MemoryWikiSubjectEntry[];
+}
+
+export interface MemoryWikiMessageHit {
+  id: number;
+  session_id: string;
+  role: string;
+  content: string;
+  timestamp: number;
+  session_title: string | null;
+  source: string | null;
+}
+
+export interface MemoryWikiSubjectDetail {
+  slug: string;
+  title: string;
+  query_terms: string[];
+  summary: {
+    session_count: number;
+    message_count: number;
+    latest_at: number;
+  };
+  wiki_summary: MemoryWikiCachedSummary;
+  sessions: MemoryWikiSessionSummary[];
+  message_hits: MemoryWikiMessageHit[];
+}
+
 export interface LogsResponse {
   file: string;
   lines: string[];
@@ -1258,6 +1353,13 @@ export interface ModelsAnalyticsModelEntry {
   tool_calls: number;
   last_used_at: number;
   avg_tokens_per_session: number;
+  tokens_to_date: number;
+  today_input_tokens: number;
+  today_output_tokens: number;
+  today_cache_read_tokens: number;
+  today_reasoning_tokens: number;
+  today_total_tokens: number;
+  today_started_at: number;
   capabilities: {
     supports_tools?: boolean;
     supports_vision?: boolean;
@@ -1280,6 +1382,13 @@ export interface ModelsAnalyticsResponse {
     total_actual_cost: number;
     total_sessions: number;
     total_api_calls: number;
+    tokens_to_date: number;
+    today_input_tokens: number;
+    today_output_tokens: number;
+    today_cache_read_tokens: number;
+    today_reasoning_tokens: number;
+    today_total_tokens: number;
+    today_started_at: number;
   };
   period_days: number;
 }
@@ -1298,6 +1407,11 @@ export interface CronJob {
   enabled: boolean;
   state?: string | null;
   deliver?: string | null;
+  model?: string | null;
+  provider?: string | null;
+  effective_model?: string | null;
+  effective_provider?: string | null;
+  uses_default_model?: boolean;
   last_run_at?: string | null;
   next_run_at?: string | null;
   last_error?: string | null;
@@ -1376,16 +1490,26 @@ export interface AuxiliaryTaskAssignment {
   base_url: string;
 }
 
+export interface ModelRoutingConfig {
+  enabled: boolean;
+  policy: string;
+  auto_route_no_agent_scripts?: boolean;
+  default_model?: { provider: string; model: string };
+  cheap_model?: { provider: string; model: string };
+  critical_model?: { provider: string; model: string };
+}
+
 export interface AuxiliaryModelsResponse {
   tasks: AuxiliaryTaskAssignment[];
   main: { provider: string; model: string };
+  routing?: ModelRoutingConfig;
 }
 
 export interface ModelAssignmentRequest {
-  scope: "main" | "auxiliary";
+  scope: "main" | "auxiliary" | "routing";
   provider: string;
   model: string;
-  /** For auxiliary: task slot name, "" for all, "__reset__" to reset all. */
+  /** For auxiliary: task slot name, "" for all, "__reset__" to reset all. For routing: cheap/default/critical. */
   task?: string;
 }
 
