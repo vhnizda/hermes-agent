@@ -1427,6 +1427,8 @@ AUTHOR_MAP = {
     "nicsequenzy@gmail.com": "polnikale",  # PR #35717 (discover Playwright headless_shell browser)
     "wasdhkzk@gmail.com": "whyhkzk",  # PR #32407 (sandbox-mirror inner-container guard; commits authored as whyhkzk + zhukun)
     "leonard@sellem.me": "leonardsellem",  # PR #37405 (desktop WS origin guard on remote/Tailscale binds)
+    "vhnizda@users.noreply.github.com": "vhnizda",  # PR #1 in vhnizda/hermes-agent (Alice memory wiki dashboard)
+    "vinoth12940@users.noreply.github.com": "vinoth12940",  # PR #1 in vhnizda/hermes-agent (fork-base attribution check)
 }
 
 
